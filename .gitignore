@@ -1,0 +1,12 @@
+# Foundry
+out/
+broadcast/
+cache/
+
+# Environment & local configs
+.env
+.env.local
+.DS_Store
+
+# Logs
+*.log

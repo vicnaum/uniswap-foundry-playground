@@ -1,0 +1,1479 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: _llms, lib, uniswap
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+bin/
+  adjust.sh
+  pool-key.sh
+  view.sh
+cache/
+  solidity-files-cache.json
+script/
+  utils/
+    BasePoolScript.sol
+    PoolIntrospection.sol
+    PoolReporter.sol
+    PoolTargetLib.sol
+  AdjustPoolPrice.s.sol
+  ViewPoolState.s.sol
+src/
+  utils/
+    PoolUtils.sol
+.env.example
+.gitmodules
+docs.md
+foundry.lock
+foundry.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="bin/adjust.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+cd "$PROJECT_ROOT"
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+fi
+
+: "${MAINNET_RPC_URL:?MAINNET_RPC_URL is required}"
+: "${PRIVATE_KEY:?PRIVATE_KEY is required}"
+
+POOL_ID_ARG="${1:-}"
+if [ -n "$POOL_ID_ARG" ]; then
+  shift
+else
+  if [ -n "${POOL_ID:-}" ]; then
+    POOL_ID_ARG="$POOL_ID"
+  else
+    echo "Usage: $(basename "$0") <poolId> [forge options...]" >&2
+    echo "Pass the poolId as the first argument or define POOL_ID in the environment." >&2
+    exit 1
+  fi
+fi
+
+TARGET_TICK_INPUT="${TARGET_TICK:-}"
+if [ -z "$TARGET_TICK_INPUT" ]; then
+  if [ -t 0 ]; then
+    read -r -p "Target tick (int24): " TARGET_TICK_INPUT </dev/tty || true
+  fi
+fi
+
+if [ -z "$TARGET_TICK_INPUT" ]; then
+  echo "Target tick is required (provide TARGET_TICK env var when running non-interactively)." >&2
+  exit 1
+fi
+
+SIM_CMD=(
+  forge script script/AdjustPoolPrice.s.sol
+  --fork-url "$MAINNET_RPC_URL"
+  "$@"
+  --
+  "$POOL_ID_ARG"
+  "$TARGET_TICK_INPUT"
+)
+
+echo "Simulating swap..."
+if ! DRY_RUN=1 "${SIM_CMD[@]}"; then
+  echo "Simulation failed. Aborting." >&2
+  exit 1
+fi
+
+CONFIRM=""
+if [ -t 0 ]; then
+  read -r -p "Broadcast transaction? [y/N] " CONFIRM </dev/tty || CONFIRM=""
+fi
+if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+  DRY_RUN=0 forge script script/AdjustPoolPrice.s.sol --rpc-url "$MAINNET_RPC_URL" --broadcast "$@" -- "$POOL_ID_ARG" "$TARGET_TICK_INPUT"
+else
+  echo "Broadcast skipped."
+fi
+</file>
+
+<file path="bin/pool-key.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") POOL_ID [--from-block BLOCK] [--to-block BLOCK]
+
+Fetch the Initialize event for a given Uniswap v4 pool id and decode the PoolKey.
+Requires MAINNET_RPC_URL and POOL_MANAGER in the environment (loaded automatically from .env if present).
+
+Options:
+  --from-block BLOCK   Optional starting block (default: 0)
+  --to-block BLOCK     Optional ending block (default: latest)
+USAGE
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+cd "$PROJECT_ROOT"
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+fi
+
+: "${MAINNET_RPC_URL:?MAINNET_RPC_URL is required}"
+: "${POOL_MANAGER:?POOL_MANAGER is required}"
+
+POOL_ID="${1:-}"
+if [ -z "$POOL_ID" ]; then
+  usage
+  exit 1
+fi
+shift
+
+FROM_BLOCK=0
+TO_BLOCK=latest
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from-block)
+      FROM_BLOCK="$2"
+      shift 2
+      ;;
+    --to-block)
+      TO_BLOCK="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+EVENT="Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)"
+
+output="$(cast logs \
+  --rpc-url "$MAINNET_RPC_URL" \
+  --address "$POOL_MANAGER" \
+  --from-block "$FROM_BLOCK" \
+  --to-block "$TO_BLOCK" \
+  --json \
+  "$EVENT" \
+  "$POOL_ID")"
+
+if [[ "$output" == "[]" ]]; then
+  echo "No Initialize logs found for poolId $POOL_ID in [${FROM_BLOCK}, ${TO_BLOCK}]." >&2
+  exit 1
+fi
+
+blockNumber="$(echo "$output" | jq -r '.[0].blockNumber')"
+txHash="$(echo "$output" | jq -r '.[0].transactionHash')"
+dataHex="$(echo "$output" | jq -r '.[0].data')"
+poolIdTopic="$(echo "$output" | jq -r '.[0].topics[1]')"
+currency0="$(echo "$output" | jq -r '.[0].topics[2] | sub("^0x0{24}";"0x")')"
+currency1="$(echo "$output" | jq -r '.[0].topics[3] | sub("^0x0{24}";"0x")')"
+
+decoded="$(cast abi-decode \
+  'f()(uint24,int24,address,uint160,int24)' \
+  "$dataHex")"
+
+mapfile -t decoded_lines <<<"$(echo "$decoded" | sed 's/^f() //')"
+fee="${decoded_lines[0]%% *}"
+tickSpacing="${decoded_lines[1]%% *}"
+hooks="${decoded_lines[2]%% *}"
+sqrtPriceX96="${decoded_lines[3]%% *}"
+tick="${decoded_lines[4]%% *}"
+
+if [[ "$hooks" == "0x0000000000000000000000000000000000000000" ]]; then
+  hooks="(none)"
+fi
+
+if [[ "$sqrtPriceX96" == "" ]]; then
+  sqrtPriceX96="0"
+fi
+
+if [[ "$tick" == "" ]]; then
+  tick="0"
+fi
+
+if [[ "$blockNumber" =~ ^0x ]]; then
+  blockNumberDec=$(printf "%d" "$blockNumber")
+else
+  blockNumberDec="$blockNumber"
+fi
+
+cat <<EOF
+Pool Initialize Event:
+  poolId        : $poolIdTopic
+  currency0     : $currency0
+  currency1     : $currency1
+  fee           : $fee
+  tickSpacing   : $tickSpacing
+  hooks         : $hooks
+  sqrtPriceX96  : $sqrtPriceX96
+  tick          : $tick
+  blockNumber   : $blockNumberDec ($blockNumber)
+  transaction   : $txHash
+EOF
+</file>
+
+<file path="bin/view.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+cd "$PROJECT_ROOT"
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+fi
+
+: "${MAINNET_RPC_URL:?MAINNET_RPC_URL is required}"
+
+POOL_ID_ARG="${1:-}"
+if [ -n "$POOL_ID_ARG" ]; then
+  shift
+else
+  if [ -n "${POOL_ID:-}" ]; then
+    POOL_ID_ARG="$POOL_ID"
+  else
+    echo "Usage: $(basename "$0") <poolId> [additional forge args...]" >&2
+    echo "Either pass the poolId as the first argument or set POOL_ID in the environment." >&2
+    exit 1
+  fi
+fi
+
+forge script script/ViewPoolState.s.sol --rpc-url "$MAINNET_RPC_URL" "$@" -- "$POOL_ID_ARG"
+</file>
+
+<file path="cache/solidity-files-cache.json">
+{"_format":"","paths":{"artifacts":"out","build_infos":"out/build-info","sources":"src","tests":"test","scripts":"script","libraries":["lib"]},"files":{"lib/forge-std/src/Base.sol":{"lastModificationDate":1763058183897,"contentHash":"f4bd67fdeb49a95a","interfaceReprHash":null,"sourceName":"lib/forge-std/src/Base.sol","imports":["lib/forge-std/src/StdStorage.sol","lib/forge-std/src/Vm.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"CommonBase":{"0.8.26":{"default":{"path":"Base.sol/CommonBase.json","build_id":"dc2bac586aec4911"}}},"ScriptBase":{"0.8.26":{"default":{"path":"Base.sol/ScriptBase.json","build_id":"dc2bac586aec4911"}}},"TestBase":{"0.8.26":{"default":{"path":"Base.sol/TestBase.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/Script.sol":{"lastModificationDate":1763058183897,"contentHash":"654eb74437773a2d","interfaceReprHash":null,"sourceName":"lib/forge-std/src/Script.sol","imports":["lib/forge-std/src/Base.sol","lib/forge-std/src/StdChains.sol","lib/forge-std/src/StdCheats.sol","lib/forge-std/src/StdConstants.sol","lib/forge-std/src/StdJson.sol","lib/forge-std/src/StdMath.sol","lib/forge-std/src/StdStorage.sol","lib/forge-std/src/StdStyle.sol","lib/forge-std/src/StdUtils.sol","lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/forge-std/src/interfaces/IMulticall3.sol","lib/forge-std/src/safeconsole.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"Script":{"0.8.26":{"default":{"path":"Script.sol/Script.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdChains.sol":{"lastModificationDate":1763058183942,"contentHash":"0adbf4fecabd792e","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdChains.sol","imports":["lib/forge-std/src/Vm.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"StdChains":{"0.8.26":{"default":{"path":"StdChains.sol/StdChains.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdCheats.sol":{"lastModificationDate":1763058183942,"contentHash":"30325e8cda32c7ae","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdCheats.sol","imports":["lib/forge-std/src/StdStorage.sol","lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"StdCheats":{"0.8.26":{"default":{"path":"StdCheats.sol/StdCheats.json","build_id":"dc2bac586aec4911"}}},"StdCheatsSafe":{"0.8.26":{"default":{"path":"StdCheats.sol/StdCheatsSafe.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdConstants.sol":{"lastModificationDate":1763058183898,"contentHash":"23303eb7e922efe4","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdConstants.sol","imports":["lib/forge-std/src/Vm.sol","lib/forge-std/src/interfaces/IMulticall3.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"StdConstants":{"0.8.26":{"default":{"path":"StdConstants.sol/StdConstants.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdJson.sol":{"lastModificationDate":1763058183942,"contentHash":"5fb1b35c8fb281fd","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdJson.sol","imports":["lib/forge-std/src/Vm.sol"],"versionRequirement":">=0.6.0, <0.9.0","artifacts":{"stdJson":{"0.8.26":{"default":{"path":"StdJson.sol/stdJson.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdMath.sol":{"lastModificationDate":1763058183942,"contentHash":"72584abebada1e7a","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdMath.sol","imports":[],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"stdMath":{"0.8.26":{"default":{"path":"StdMath.sol/stdMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdStorage.sol":{"lastModificationDate":1763058183898,"contentHash":"9a44dcb9bda3bfa9","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdStorage.sol","imports":["lib/forge-std/src/Vm.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"stdStorage":{"0.8.26":{"default":{"path":"StdStorage.sol/stdStorage.json","build_id":"dc2bac586aec4911"}}},"stdStorageSafe":{"0.8.26":{"default":{"path":"StdStorage.sol/stdStorageSafe.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdStyle.sol":{"lastModificationDate":1763058183898,"contentHash":"ee166ef95092736e","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdStyle.sol","imports":["lib/forge-std/src/Vm.sol"],"versionRequirement":">=0.4.22, <0.9.0","artifacts":{"StdStyle":{"0.8.26":{"default":{"path":"StdStyle.sol/StdStyle.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/StdUtils.sol":{"lastModificationDate":1763058183899,"contentHash":"b7cdeb66252de708","interfaceReprHash":null,"sourceName":"lib/forge-std/src/StdUtils.sol","imports":["lib/forge-std/src/Vm.sol","lib/forge-std/src/interfaces/IMulticall3.sol"],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"StdUtils":{"0.8.26":{"default":{"path":"StdUtils.sol/StdUtils.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/Vm.sol":{"lastModificationDate":1763058183943,"contentHash":"803443adcf84cfaa","interfaceReprHash":null,"sourceName":"lib/forge-std/src/Vm.sol","imports":[],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"Vm":{"0.8.26":{"default":{"path":"Vm.sol/Vm.json","build_id":"dc2bac586aec4911"}}},"VmSafe":{"0.8.26":{"default":{"path":"Vm.sol/VmSafe.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/console.sol":{"lastModificationDate":1763058183899,"contentHash":"bae85493a76fb054","interfaceReprHash":null,"sourceName":"lib/forge-std/src/console.sol","imports":[],"versionRequirement":">=0.4.22, <0.9.0","artifacts":{"console":{"0.8.26":{"default":{"path":"console.sol/console.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/console2.sol":{"lastModificationDate":1763058183899,"contentHash":"49a7da3dfc404603","interfaceReprHash":null,"sourceName":"lib/forge-std/src/console2.sol","imports":["lib/forge-std/src/console.sol"],"versionRequirement":">=0.4.22, <0.9.0","artifacts":{},"seenByCompiler":true},"lib/forge-std/src/interfaces/IMulticall3.sol":{"lastModificationDate":1763058183943,"contentHash":"b680a332ebf10901","interfaceReprHash":null,"sourceName":"lib/forge-std/src/interfaces/IMulticall3.sol","imports":[],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"IMulticall3":{"0.8.26":{"default":{"path":"IMulticall3.sol/IMulticall3.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/forge-std/src/safeconsole.sol":{"lastModificationDate":1763058183900,"contentHash":"621653b34a6691ea","interfaceReprHash":null,"sourceName":"lib/forge-std/src/safeconsole.sol","imports":[],"versionRequirement":">=0.6.2, <0.9.0","artifacts":{"safeconsole":{"0.8.26":{"default":{"path":"safeconsole.sol/safeconsole.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol":{"lastModificationDate":1763060840098,"contentHash":"1dcd768972ff31b3","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","imports":[],"versionRequirement":">=0.4.16","artifacts":{"IERC20":{"0.8.26":{"default":{"path":"IERC20.sol/IERC20.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol":{"lastModificationDate":1763060840099,"contentHash":"c0fde354a75fbdc6","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol"],"versionRequirement":">=0.6.2","artifacts":{"IERC20Metadata":{"0.8.26":{"default":{"path":"IERC20Metadata.sol/IERC20Metadata.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/Bytes.sol":{"lastModificationDate":1763060840103,"contentHash":"1bbf72b0d2e837dc","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/Bytes.sol","imports":["lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol"],"versionRequirement":"^0.8.24","artifacts":{"Bytes":{"0.8.26":{"default":{"path":"Bytes.sol/Bytes.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/Panic.sol":{"lastModificationDate":1763060840105,"contentHash":"cfb5098ef78673ff","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/Panic.sol","imports":[],"versionRequirement":"^0.8.20","artifacts":{"Panic":{"0.8.26":{"default":{"path":"Panic.sol/Panic.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/Strings.sol":{"lastModificationDate":1763060840106,"contentHash":"b8cc4443ad6bffa6","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/Strings.sol","imports":["lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol"],"versionRequirement":"^0.8.24","artifacts":{"Strings":{"0.8.26":{"default":{"path":"Strings.sol/Strings.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol":{"lastModificationDate":1763060840110,"contentHash":"021ac46c8076d0ee","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol","imports":[],"versionRequirement":">=0.4.16","artifacts":{"IERC165":{"0.8.26":{"default":{"path":"IERC165.sol/IERC165.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/math/Math.sol":{"lastModificationDate":1763060840242,"contentHash":"e0e75638577b522b","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/math/Math.sol","imports":["lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol"],"versionRequirement":"^0.8.20","artifacts":{"Math":{"0.8.26":{"default":{"path":"Math.sol/Math.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol":{"lastModificationDate":1763060840110,"contentHash":"5a907d9c96fd0da2","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","imports":[],"versionRequirement":"^0.8.20","artifacts":{"SafeCast":{"0.8.26":{"default":{"path":"math/SafeCast.sol/SafeCast.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol":{"lastModificationDate":1763060840110,"contentHash":"d7e482c0d6f136d7","interfaceReprHash":null,"sourceName":"lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","imports":["lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol"],"versionRequirement":"^0.8.20","artifacts":{"SignedMath":{"0.8.26":{"default":{"path":"SignedMath.sol/SignedMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/permit2/src/interfaces/IAllowanceTransfer.sol":{"lastModificationDate":1763057863525,"contentHash":"2e466e73ac6745f8","interfaceReprHash":null,"sourceName":"lib/permit2/src/interfaces/IAllowanceTransfer.sol","imports":["lib/permit2/src/interfaces/IEIP712.sol"],"versionRequirement":"^0.8.0","artifacts":{"IAllowanceTransfer":{"0.8.26":{"default":{"path":"IAllowanceTransfer.sol/IAllowanceTransfer.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/permit2/src/interfaces/IEIP712.sol":{"lastModificationDate":1763057863525,"contentHash":"d6f6562ab61ab449","interfaceReprHash":null,"sourceName":"lib/permit2/src/interfaces/IEIP712.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IEIP712":{"0.8.26":{"default":{"path":"IEIP712.sol/IEIP712.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/permit2/src/interfaces/IPermit2.sol":{"lastModificationDate":1763057863525,"contentHash":"1d6b2e9f59cd428b","interfaceReprHash":null,"sourceName":"lib/permit2/src/interfaces/IPermit2.sol","imports":["lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol"],"versionRequirement":"^0.8.0","artifacts":{"IPermit2":{"0.8.26":{"default":{"path":"IPermit2.sol/IPermit2.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/permit2/src/interfaces/ISignatureTransfer.sol":{"lastModificationDate":1763057863525,"contentHash":"289798c069e82e40","interfaceReprHash":null,"sourceName":"lib/permit2/src/interfaces/ISignatureTransfer.sol","imports":["lib/permit2/src/interfaces/IEIP712.sol"],"versionRequirement":"^0.8.0","artifacts":{"ISignatureTransfer":{"0.8.26":{"default":{"path":"ISignatureTransfer.sol/ISignatureTransfer.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/permit2/src/libraries/SafeCast160.sol":{"lastModificationDate":1763057863526,"contentHash":"f6f81eca1e697340","interfaceReprHash":null,"sourceName":"lib/permit2/src/libraries/SafeCast160.sol","imports":[],"versionRequirement":"^0.8.17","artifacts":{"SafeCast160":{"0.8.26":{"default":{"path":"SafeCast160.sol/SafeCast160.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/UniversalRouter.sol":{"lastModificationDate":1763061359070,"contentHash":"f5b8a920ed7251cb","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/UniversalRouter.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/base/Callbacks.sol","lib/universal-router/contracts/base/Dispatcher.sol","lib/universal-router/contracts/base/LockAndMsgSender.sol","lib/universal-router/contracts/base/RouterImmutables.sol","lib/universal-router/contracts/interfaces/IUniversalRouter.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Commands.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol","lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","lib/v3-core/contracts/libraries/SafeCast.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/V4Router.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.24","artifacts":{"UniversalRouter":{"0.8.26":{"default":{"path":"UniversalRouter.sol/UniversalRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/base/Callbacks.sol":{"lastModificationDate":1763058617593,"contentHash":"8bea97952cdb03f7","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/base/Callbacks.sol","imports":["lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol"],"versionRequirement":"^0.8.24","artifacts":{"Callbacks":{"0.8.26":{"default":{"path":"Callbacks.sol/Callbacks.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/base/Dispatcher.sol":{"lastModificationDate":1763058617593,"contentHash":"141b49070628216c","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/base/Dispatcher.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/base/Callbacks.sol","lib/universal-router/contracts/base/LockAndMsgSender.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Commands.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol","lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","lib/v3-core/contracts/libraries/SafeCast.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/V4Router.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.24","artifacts":{"Dispatcher":{"0.8.26":{"default":{"path":"Dispatcher.sol/Dispatcher.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/base/LockAndMsgSender.sol":{"lastModificationDate":1763058617593,"contentHash":"778e0c68380dfe82","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/base/LockAndMsgSender.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol"],"versionRequirement":"^0.8.24","artifacts":{"LockAndMsgSender":{"0.8.26":{"default":{"path":"LockAndMsgSender.sol/LockAndMsgSender.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/base/RouterImmutables.sol":{"lastModificationDate":1763058617593,"contentHash":"8572612ecaa90d8b","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/base/RouterImmutables.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{},"seenByCompiler":true},"lib/universal-router/contracts/interfaces/IUniversalRouter.sol":{"lastModificationDate":1763058617593,"contentHash":"80f9ae496c514d68","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/interfaces/IUniversalRouter.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"IUniversalRouter":{"0.8.26":{"default":{"path":"IUniversalRouter.sol/IUniversalRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/interfaces/external/IWETH9.sol":{"lastModificationDate":1763057874184,"contentHash":"96defec5d6dfbabb","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/interfaces/external/IWETH9.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol"],"versionRequirement":"^0.8.4","artifacts":{"IWETH9":{"0.8.26":{"default":{"path":"IWETH9.sol/IWETH9.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/libraries/Commands.sol":{"lastModificationDate":1763058617593,"contentHash":"a8a433d07c4e2be4","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/libraries/Commands.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"Commands":{"0.8.26":{"default":{"path":"Commands.sol/Commands.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/libraries/Constants.sol":{"lastModificationDate":1763058617593,"contentHash":"85ba8e59ab4517af","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/libraries/Constants.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol"],"versionRequirement":"^0.8.24","artifacts":{"Constants":{"0.8.26":{"default":{"path":"Constants.sol/Constants.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/Payments.sol":{"lastModificationDate":1763058617593,"contentHash":"232affc9c4477637","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/Payments.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol"],"versionRequirement":"^0.8.24","artifacts":{"Payments":{"0.8.26":{"default":{"path":"Payments.sol/Payments.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/PaymentsImmutables.sol":{"lastModificationDate":1763058617593,"contentHash":"822fbba2168e2d52","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/PaymentsImmutables.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol"],"versionRequirement":"^0.8.24","artifacts":{"PaymentsImmutables":{"0.8.26":{"default":{"path":"PaymentsImmutables.sol/PaymentsImmutables.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/Permit2Payments.sol":{"lastModificationDate":1763058617594,"contentHash":"00ff24674e3590b9","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/Permit2Payments.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol"],"versionRequirement":"^0.8.24","artifacts":{"Permit2Payments":{"0.8.26":{"default":{"path":"Permit2Payments.sol/Permit2Payments.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol":{"lastModificationDate":1763058617594,"contentHash":"817287c3b2852e73","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"UniswapImmutables":{"0.8.26":{"default":{"path":"UniswapImmutables.sol/UniswapImmutables.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol":{"lastModificationDate":1763057874185,"contentHash":"de165cb34447c7bc","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","imports":["lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol"],"versionRequirement":">=0.8.0","artifacts":{"UniswapV2Library":{"0.8.26":{"default":{"path":"UniswapV2Library.sol/UniswapV2Library.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol":{"lastModificationDate":1763058617594,"contentHash":"7c3c3c0e20666bce","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol"],"versionRequirement":"^0.8.24","artifacts":{"V2SwapRouter":{"0.8.26":{"default":{"path":"V2SwapRouter.sol/V2SwapRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol":{"lastModificationDate":1763057874186,"contentHash":"5020ae150a54b7b2","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol"],"versionRequirement":"^0.8.0","artifacts":{"BytesLib":{"0.8.26":{"default":{"path":"BytesLib.sol/BytesLib.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol":{"lastModificationDate":1763057874113,"contentHash":"15949524308842bd","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol"],"versionRequirement":">=0.6.0","artifacts":{"V3Path":{"0.8.26":{"default":{"path":"V3Path.sol/V3Path.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol":{"lastModificationDate":1763058617594,"contentHash":"9651026f300103cf","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","lib/v3-core/contracts/libraries/SafeCast.sol"],"versionRequirement":"^0.8.24","artifacts":{"V3SwapRouter":{"0.8.26":{"default":{"path":"V3SwapRouter.sol/V3SwapRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol":{"lastModificationDate":1763061359070,"contentHash":"362a3f73b7d627b6","interfaceReprHash":null,"sourceName":"lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/V4Router.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.24","artifacts":{"V4SwapRouter":{"0.8.26":{"default":{"path":"V4SwapRouter.sol/V4SwapRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/lib/solmate/src/tokens/ERC20.sol":{"lastModificationDate":1763058065640,"contentHash":"3a5811aa46735b64","interfaceReprHash":null,"sourceName":"lib/universal-router/lib/solmate/src/tokens/ERC20.sol","imports":[],"versionRequirement":">=0.8.0","artifacts":{"ERC20":{"0.8.26":{"default":{"path":"ERC20.sol/ERC20.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol":{"lastModificationDate":1763058065643,"contentHash":"5f6a2160ed7c4442","interfaceReprHash":null,"sourceName":"lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","imports":["lib/universal-router/lib/solmate/src/tokens/ERC20.sol"],"versionRequirement":">=0.8.0","artifacts":{"SafeTransferLib":{"0.8.26":{"default":{"path":"SafeTransferLib.sol/SafeTransferLib.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol":{"lastModificationDate":1763060835933,"contentHash":"cb076d06ef2c2bea","interfaceReprHash":null,"sourceName":"lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV2Pair":{"0.8.26":{"default":{"path":"IUniswapV2Pair.sol/IUniswapV2Pair.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol":{"lastModificationDate":1763060834926,"contentHash":"9e83ffe83bd681c1","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","imports":["lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol"],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3Pool":{"0.8.26":{"default":{"path":"IUniswapV3Pool.sol/IUniswapV3Pool.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol":{"lastModificationDate":1763060834927,"contentHash":"806d6a46736e2030","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3SwapCallback":{"0.8.26":{"default":{"path":"IUniswapV3SwapCallback.sol/IUniswapV3SwapCallback.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol":{"lastModificationDate":1763060834927,"contentHash":"a244981cb8144efe","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolActions":{"0.8.26":{"default":{"path":"IUniswapV3PoolActions.sol/IUniswapV3PoolActions.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol":{"lastModificationDate":1763060834927,"contentHash":"0667aff77955b42d","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolDerivedState":{"0.8.26":{"default":{"path":"IUniswapV3PoolDerivedState.sol/IUniswapV3PoolDerivedState.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol":{"lastModificationDate":1763060834927,"contentHash":"2b815f30570923eb","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolEvents":{"0.8.26":{"default":{"path":"IUniswapV3PoolEvents.sol/IUniswapV3PoolEvents.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol":{"lastModificationDate":1763060834927,"contentHash":"7408be84ec900911","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolImmutables":{"0.8.26":{"default":{"path":"IUniswapV3PoolImmutables.sol/IUniswapV3PoolImmutables.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol":{"lastModificationDate":1763060834927,"contentHash":"710ae78b72fbc0ba","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolOwnerActions":{"0.8.26":{"default":{"path":"IUniswapV3PoolOwnerActions.sol/IUniswapV3PoolOwnerActions.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol":{"lastModificationDate":1763060834927,"contentHash":"f99b495634d3a32e","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"IUniswapV3PoolState":{"0.8.26":{"default":{"path":"IUniswapV3PoolState.sol/IUniswapV3PoolState.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v3-core/contracts/libraries/SafeCast.sol":{"lastModificationDate":1763060834928,"contentHash":"5960db617af675a6","interfaceReprHash":null,"sourceName":"lib/v3-core/contracts/libraries/SafeCast.sol","imports":[],"versionRequirement":">=0.5.0","artifacts":{"SafeCast":{"0.8.26":{"default":{"path":"SafeCast.sol/SafeCast.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/IExtsload.sol":{"lastModificationDate":1763057815218,"contentHash":"a17834d80eb9b2bc","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/IExtsload.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IExtsload":{"0.8.26":{"default":{"path":"IExtsload.sol/IExtsload.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/IExttload.sol":{"lastModificationDate":1763057815218,"contentHash":"2190199c75e2ba4c","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/IExttload.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"IExttload":{"0.8.26":{"default":{"path":"IExttload.sol/IExttload.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/IHooks.sol":{"lastModificationDate":1763060928977,"contentHash":"20955fcb07703cbb","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/IHooks.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"IHooks":{"0.8.26":{"default":{"path":"IHooks.sol/IHooks.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/IPoolManager.sol":{"lastModificationDate":1763060928977,"contentHash":"55b387e0bef6194d","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/IPoolManager.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.24","artifacts":{"IPoolManager":{"0.8.26":{"default":{"path":"IPoolManager.sol/IPoolManager.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/IProtocolFees.sol":{"lastModificationDate":1763057815218,"contentHash":"3c0177865aba04df","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/IProtocolFees.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"IProtocolFees":{"0.8.26":{"default":{"path":"IProtocolFees.sol/IProtocolFees.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/callback/IUnlockCallback.sol":{"lastModificationDate":1763057815218,"contentHash":"34c17f6eb3fe1724","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IUnlockCallback":{"0.8.26":{"default":{"path":"IUnlockCallback.sol/IUnlockCallback.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/external/IERC20Minimal.sol":{"lastModificationDate":1763057815219,"contentHash":"0f6d7a7184d7615a","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/external/IERC20Minimal.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IERC20Minimal":{"0.8.26":{"default":{"path":"IERC20Minimal.sol/IERC20Minimal.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/interfaces/external/IERC6909Claims.sol":{"lastModificationDate":1763057815219,"contentHash":"569c1f335115f451","interfaceReprHash":null,"sourceName":"lib/v4-core/src/interfaces/external/IERC6909Claims.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IERC6909Claims":{"0.8.26":{"default":{"path":"IERC6909Claims.sol/IERC6909Claims.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/BitMath.sol":{"lastModificationDate":1763057815219,"contentHash":"aafc86b627d37351","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/BitMath.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"BitMath":{"0.8.26":{"default":{"path":"BitMath.sol/BitMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/CurrencyReserves.sol":{"lastModificationDate":1763057815219,"contentHash":"ba078037e85c6dc9","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/CurrencyReserves.sol","imports":["lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/types/Currency.sol"],"versionRequirement":"^0.8.24","artifacts":{"CurrencyReserves":{"0.8.26":{"default":{"path":"CurrencyReserves.sol/CurrencyReserves.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/CustomRevert.sol":{"lastModificationDate":1763057815219,"contentHash":"ecf219a3788afb76","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/CustomRevert.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"CustomRevert":{"0.8.26":{"default":{"path":"CustomRevert.sol/CustomRevert.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/FixedPoint128.sol":{"lastModificationDate":1763057815219,"contentHash":"1d7b4a03fd8f596b","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/FixedPoint128.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"FixedPoint128":{"0.8.26":{"default":{"path":"FixedPoint128.sol/FixedPoint128.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/FullMath.sol":{"lastModificationDate":1763057815219,"contentHash":"438bb56917e7cf4a","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/FullMath.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"FullMath":{"0.8.26":{"default":{"path":"FullMath.sol/FullMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/LiquidityMath.sol":{"lastModificationDate":1763057815220,"contentHash":"05de39bcd6b175f1","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/LiquidityMath.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"LiquidityMath":{"0.8.26":{"default":{"path":"LiquidityMath.sol/LiquidityMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/Lock.sol":{"lastModificationDate":1763057815220,"contentHash":"1f4646a17e5d0a16","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/Lock.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"Lock":{"0.8.26":{"default":{"path":"Lock.sol/Lock.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/NonzeroDeltaCount.sol":{"lastModificationDate":1763057815220,"contentHash":"d1319bbe2cd871d8","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/NonzeroDeltaCount.sol","imports":[],"versionRequirement":"^0.8.24","artifacts":{"NonzeroDeltaCount":{"0.8.26":{"default":{"path":"NonzeroDeltaCount.sol/NonzeroDeltaCount.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/Position.sol":{"lastModificationDate":1763057815220,"contentHash":"fe4c4e4800f71410","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/Position.sol","imports":["lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol"],"versionRequirement":"^0.8.0","artifacts":{"Position":{"0.8.26":{"default":{"path":"Position.sol/Position.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/SafeCast.sol":{"lastModificationDate":1763057815220,"contentHash":"26fb30c1b1acd84b","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/SafeCast.sol","imports":["lib/v4-core/src/libraries/CustomRevert.sol"],"versionRequirement":"^0.8.0","artifacts":{"SafeCast":{"0.8.26":{"default":{"path":"libraries/SafeCast.sol/SafeCast.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/StateLibrary.sol":{"lastModificationDate":1763057815221,"contentHash":"c0f91c4e4d1632a3","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/StateLibrary.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"StateLibrary":{"0.8.26":{"default":{"path":"StateLibrary.sol/StateLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/TickMath.sol":{"lastModificationDate":1763057815221,"contentHash":"1b639507c250adc8","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/TickMath.sol","imports":["lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol"],"versionRequirement":"^0.8.0","artifacts":{"TickMath":{"0.8.26":{"default":{"path":"TickMath.sol/TickMath.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/libraries/TransientStateLibrary.sol":{"lastModificationDate":1763057815221,"contentHash":"66f93b54e9ce0c03","interfaceReprHash":null,"sourceName":"lib/v4-core/src/libraries/TransientStateLibrary.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.24","artifacts":{"TransientStateLibrary":{"0.8.26":{"default":{"path":"TransientStateLibrary.sol/TransientStateLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/types/BalanceDelta.sol":{"lastModificationDate":1763057815225,"contentHash":"07b92dc9ccfa0d15","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/BalanceDelta.sol","imports":["lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol"],"versionRequirement":"^0.8.0","artifacts":{"BalanceDeltaLibrary":{"0.8.26":{"default":{"path":"BalanceDelta.sol/BalanceDeltaLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/types/BeforeSwapDelta.sol":{"lastModificationDate":1763057815225,"contentHash":"b33ea5fde5fb62e8","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/BeforeSwapDelta.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"BeforeSwapDeltaLibrary":{"0.8.26":{"default":{"path":"BeforeSwapDelta.sol/BeforeSwapDeltaLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/types/Currency.sol":{"lastModificationDate":1763057815225,"contentHash":"3d6032f443b702df","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/Currency.sol","imports":["lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol"],"versionRequirement":"^0.8.0","artifacts":{"CurrencyLibrary":{"0.8.26":{"default":{"path":"Currency.sol/CurrencyLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/types/PoolId.sol":{"lastModificationDate":1763057815225,"contentHash":"cc46093270e207ad","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/PoolId.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"PoolIdLibrary":{"0.8.26":{"default":{"path":"PoolId.sol/PoolIdLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-core/src/types/PoolKey.sol":{"lastModificationDate":1763057815225,"contentHash":"ade39c50c30272fb","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/PoolKey.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{},"seenByCompiler":true},"lib/v4-core/src/types/PoolOperation.sol":{"lastModificationDate":1763060928979,"contentHash":"88f097de43481c6e","interfaceReprHash":null,"sourceName":"lib/v4-core/src/types/PoolOperation.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.24","artifacts":{},"seenByCompiler":true},"lib/v4-periphery/src/V4Router.sol":{"lastModificationDate":1763057834674,"contentHash":"462af7d13faedf5f","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/V4Router.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"=0.8.26","artifacts":{"V4Router":{"0.8.26":{"default":{"path":"V4Router.sol/V4Router.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/base/BaseActionsRouter.sol":{"lastModificationDate":1763057834674,"contentHash":"563d3596fb941b2a","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/base/BaseActionsRouter.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.0","artifacts":{"BaseActionsRouter":{"0.8.26":{"default":{"path":"BaseActionsRouter.sol/BaseActionsRouter.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/base/DeltaResolver.sol":{"lastModificationDate":1763057834675,"contentHash":"0feb8a34fe908b0f","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/base/DeltaResolver.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/libraries/ActionConstants.sol"],"versionRequirement":"^0.8.24","artifacts":{"DeltaResolver":{"0.8.26":{"default":{"path":"DeltaResolver.sol/DeltaResolver.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/base/ImmutableState.sol":{"lastModificationDate":1763057834675,"contentHash":"70cca92d3712b8aa","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/base/ImmutableState.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol"],"versionRequirement":"^0.8.0","artifacts":{"ImmutableState":{"0.8.26":{"default":{"path":"ImmutableState.sol/ImmutableState.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/base/SafeCallback.sol":{"lastModificationDate":1763057834675,"contentHash":"58617f977152aa1d","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/base/SafeCallback.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol"],"versionRequirement":"^0.8.0","artifacts":{"SafeCallback":{"0.8.26":{"default":{"path":"SafeCallback.sol/SafeCallback.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/interfaces/IImmutableState.sol":{"lastModificationDate":1763057834676,"contentHash":"511d66363c7b387b","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/interfaces/IImmutableState.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"IImmutableState":{"0.8.26":{"default":{"path":"IImmutableState.sol/IImmutableState.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/interfaces/IMsgSender.sol":{"lastModificationDate":1763057834676,"contentHash":"8117c20b5495e19d","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/interfaces/IMsgSender.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"IMsgSender":{"0.8.26":{"default":{"path":"IMsgSender.sol/IMsgSender.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/interfaces/IV4Router.sol":{"lastModificationDate":1763057834676,"contentHash":"aaca8880ef2598bd","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/interfaces/IV4Router.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.0","artifacts":{"IV4Router":{"0.8.26":{"default":{"path":"IV4Router.sol/IV4Router.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/libraries/ActionConstants.sol":{"lastModificationDate":1763057834677,"contentHash":"4cddc9cd8cda8470","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/libraries/ActionConstants.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"ActionConstants":{"0.8.26":{"default":{"path":"ActionConstants.sol/ActionConstants.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/libraries/Actions.sol":{"lastModificationDate":1763057834677,"contentHash":"db4318138c81e91e","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/libraries/Actions.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"Actions":{"0.8.26":{"default":{"path":"Actions.sol/Actions.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/libraries/BipsLibrary.sol":{"lastModificationDate":1763057834677,"contentHash":"3d639964358d3d24","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/libraries/BipsLibrary.sol","imports":[],"versionRequirement":"^0.8.0","artifacts":{"BipsLibrary":{"0.8.26":{"default":{"path":"BipsLibrary.sol/BipsLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/libraries/CalldataDecoder.sol":{"lastModificationDate":1763057834677,"contentHash":"8f70bc0d977af953","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/libraries/CalldataDecoder.sol","imports":["lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.0","artifacts":{"CalldataDecoder":{"0.8.26":{"default":{"path":"CalldataDecoder.sol/CalldataDecoder.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"lib/v4-periphery/src/libraries/PathKey.sol":{"lastModificationDate":1763057834677,"contentHash":"9563518739b132c2","interfaceReprHash":null,"sourceName":"lib/v4-periphery/src/libraries/PathKey.sol","imports":["lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.0","artifacts":{"PathKeyLibrary":{"0.8.26":{"default":{"path":"PathKey.sol/PathKeyLibrary.json","build_id":"dc2bac586aec4911"}}}},"seenByCompiler":true},"script/AdjustPoolPrice.s.sol":{"lastModificationDate":1763209135932,"contentHash":"5b93fe98ff310158","interfaceReprHash":null,"sourceName":"script/AdjustPoolPrice.s.sol","imports":["lib/forge-std/src/Base.sol","lib/forge-std/src/Script.sol","lib/forge-std/src/StdChains.sol","lib/forge-std/src/StdCheats.sol","lib/forge-std/src/StdConstants.sol","lib/forge-std/src/StdJson.sol","lib/forge-std/src/StdMath.sol","lib/forge-std/src/StdStorage.sol","lib/forge-std/src/StdStyle.sol","lib/forge-std/src/StdUtils.sol","lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/forge-std/src/interfaces/IMulticall3.sol","lib/forge-std/src/safeconsole.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/UniversalRouter.sol","lib/universal-router/contracts/base/Callbacks.sol","lib/universal-router/contracts/base/Dispatcher.sol","lib/universal-router/contracts/base/LockAndMsgSender.sol","lib/universal-router/contracts/base/RouterImmutables.sol","lib/universal-router/contracts/interfaces/IUniversalRouter.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Commands.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol","lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","lib/v3-core/contracts/libraries/SafeCast.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/V4Router.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol","script/utils/BasePoolScript.sol","script/utils/PoolIntrospection.sol","script/utils/PoolReporter.sol","script/utils/PoolTargetLib.sol","src/utils/PoolUtils.sol"],"versionRequirement":"^0.8.26","artifacts":{"AdjustPoolPriceScript":{"0.8.26":{"default":{"path":"AdjustPoolPrice.s.sol/AdjustPoolPriceScript.json","build_id":"742c9357206a65dd"}}}},"seenByCompiler":true},"script/ViewPoolState.s.sol":{"lastModificationDate":1763069809480,"contentHash":"334b08918d133a1b","interfaceReprHash":null,"sourceName":"script/ViewPoolState.s.sol","imports":["lib/forge-std/src/Base.sol","lib/forge-std/src/Script.sol","lib/forge-std/src/StdChains.sol","lib/forge-std/src/StdCheats.sol","lib/forge-std/src/StdConstants.sol","lib/forge-std/src/StdJson.sol","lib/forge-std/src/StdMath.sol","lib/forge-std/src/StdStorage.sol","lib/forge-std/src/StdStyle.sol","lib/forge-std/src/StdUtils.sol","lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/forge-std/src/interfaces/IMulticall3.sol","lib/forge-std/src/safeconsole.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","script/utils/PoolIntrospection.sol","script/utils/PoolReporter.sol","script/utils/PoolTargetLib.sol","src/utils/PoolUtils.sol"],"versionRequirement":"^0.8.26","artifacts":{"ViewPoolStateScript":{"0.8.26":{"default":{"path":"ViewPoolState.s.sol/ViewPoolStateScript.json","build_id":"9c46e186f26e3634"}}}},"seenByCompiler":true},"script/utils/BasePoolScript.sol":{"lastModificationDate":1763209284530,"contentHash":"d01564aec10b2e79","interfaceReprHash":null,"sourceName":"script/utils/BasePoolScript.sol","imports":["lib/forge-std/src/Base.sol","lib/forge-std/src/Script.sol","lib/forge-std/src/StdChains.sol","lib/forge-std/src/StdCheats.sol","lib/forge-std/src/StdConstants.sol","lib/forge-std/src/StdJson.sol","lib/forge-std/src/StdMath.sol","lib/forge-std/src/StdStorage.sol","lib/forge-std/src/StdStyle.sol","lib/forge-std/src/StdUtils.sol","lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/forge-std/src/interfaces/IMulticall3.sol","lib/forge-std/src/safeconsole.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol","lib/permit2/src/interfaces/IAllowanceTransfer.sol","lib/permit2/src/interfaces/IEIP712.sol","lib/permit2/src/interfaces/IPermit2.sol","lib/permit2/src/interfaces/ISignatureTransfer.sol","lib/permit2/src/libraries/SafeCast160.sol","lib/universal-router/contracts/UniversalRouter.sol","lib/universal-router/contracts/base/Callbacks.sol","lib/universal-router/contracts/base/Dispatcher.sol","lib/universal-router/contracts/base/LockAndMsgSender.sol","lib/universal-router/contracts/base/RouterImmutables.sol","lib/universal-router/contracts/interfaces/IUniversalRouter.sol","lib/universal-router/contracts/interfaces/external/IWETH9.sol","lib/universal-router/contracts/libraries/Commands.sol","lib/universal-router/contracts/libraries/Constants.sol","lib/universal-router/contracts/modules/Payments.sol","lib/universal-router/contracts/modules/PaymentsImmutables.sol","lib/universal-router/contracts/modules/Permit2Payments.sol","lib/universal-router/contracts/modules/uniswap/UniswapImmutables.sol","lib/universal-router/contracts/modules/uniswap/v2/UniswapV2Library.sol","lib/universal-router/contracts/modules/uniswap/v2/V2SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v3/BytesLib.sol","lib/universal-router/contracts/modules/uniswap/v3/V3Path.sol","lib/universal-router/contracts/modules/uniswap/v3/V3SwapRouter.sol","lib/universal-router/contracts/modules/uniswap/v4/V4SwapRouter.sol","lib/universal-router/lib/solmate/src/tokens/ERC20.sol","lib/universal-router/lib/solmate/src/utils/SafeTransferLib.sol","lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol","lib/v3-core/contracts/interfaces/IUniswapV3Pool.sol","lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolDerivedState.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolEvents.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolImmutables.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolOwnerActions.sol","lib/v3-core/contracts/interfaces/pool/IUniswapV3PoolState.sol","lib/v3-core/contracts/libraries/SafeCast.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/callback/IUnlockCallback.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CurrencyReserves.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/Lock.sol","lib/v4-core/src/libraries/NonzeroDeltaCount.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/libraries/TransientStateLibrary.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","lib/v4-periphery/src/V4Router.sol","lib/v4-periphery/src/base/BaseActionsRouter.sol","lib/v4-periphery/src/base/DeltaResolver.sol","lib/v4-periphery/src/base/ImmutableState.sol","lib/v4-periphery/src/base/SafeCallback.sol","lib/v4-periphery/src/interfaces/IImmutableState.sol","lib/v4-periphery/src/interfaces/IMsgSender.sol","lib/v4-periphery/src/interfaces/IV4Router.sol","lib/v4-periphery/src/libraries/ActionConstants.sol","lib/v4-periphery/src/libraries/Actions.sol","lib/v4-periphery/src/libraries/BipsLibrary.sol","lib/v4-periphery/src/libraries/CalldataDecoder.sol","lib/v4-periphery/src/libraries/PathKey.sol"],"versionRequirement":"^0.8.26","artifacts":{"BasePoolScript":{"0.8.26":{"default":{"path":"BasePoolScript.sol/BasePoolScript.json","build_id":"742c9357206a65dd"}}}},"seenByCompiler":true},"script/utils/PoolIntrospection.sol":{"lastModificationDate":1763069249241,"contentHash":"21f2224aee1f842f","interfaceReprHash":null,"sourceName":"script/utils/PoolIntrospection.sol","imports":["lib/forge-std/src/Vm.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","src/utils/PoolUtils.sol"],"versionRequirement":"^0.8.26","artifacts":{"PoolIntrospection":{"0.8.26":{"default":{"path":"PoolIntrospection.sol/PoolIntrospection.json","build_id":"ab21b11005cd0c73"}}}},"seenByCompiler":true},"script/utils/PoolReporter.sol":{"lastModificationDate":1763065424627,"contentHash":"f18253c3874b9805","interfaceReprHash":null,"sourceName":"script/utils/PoolReporter.sol","imports":["lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","src/utils/PoolUtils.sol"],"versionRequirement":"^0.8.26","artifacts":{"PoolReporter":{"0.8.26":{"default":{"path":"PoolReporter.sol/PoolReporter.json","build_id":"1d7b5b038af6b622"}}}},"seenByCompiler":true},"script/utils/PoolTargetLib.sol":{"lastModificationDate":1763069831191,"contentHash":"49b13b10da0c6584","interfaceReprHash":null,"sourceName":"script/utils/PoolTargetLib.sol","imports":["lib/forge-std/src/Vm.sol","lib/forge-std/src/console.sol","lib/forge-std/src/console2.sol","lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol","src/utils/PoolUtils.sol"],"versionRequirement":"^0.8.26","artifacts":{"PoolTargetLib":{"0.8.26":{"default":{"path":"PoolTargetLib.sol/PoolTargetLib.json","build_id":"ae88cb63fed338ea"}}}},"seenByCompiler":true},"src/utils/PoolUtils.sol":{"lastModificationDate":1763065652029,"contentHash":"4542e9724aaf34ce","interfaceReprHash":null,"sourceName":"src/utils/PoolUtils.sol","imports":["lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol","lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol","lib/openzeppelin-contracts/contracts/utils/Bytes.sol","lib/openzeppelin-contracts/contracts/utils/Panic.sol","lib/openzeppelin-contracts/contracts/utils/Strings.sol","lib/openzeppelin-contracts/contracts/utils/math/Math.sol","lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol","lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol","lib/v4-core/src/interfaces/IExtsload.sol","lib/v4-core/src/interfaces/IExttload.sol","lib/v4-core/src/interfaces/IHooks.sol","lib/v4-core/src/interfaces/IPoolManager.sol","lib/v4-core/src/interfaces/IProtocolFees.sol","lib/v4-core/src/interfaces/external/IERC20Minimal.sol","lib/v4-core/src/interfaces/external/IERC6909Claims.sol","lib/v4-core/src/libraries/BitMath.sol","lib/v4-core/src/libraries/CustomRevert.sol","lib/v4-core/src/libraries/FixedPoint128.sol","lib/v4-core/src/libraries/FullMath.sol","lib/v4-core/src/libraries/LiquidityMath.sol","lib/v4-core/src/libraries/Position.sol","lib/v4-core/src/libraries/SafeCast.sol","lib/v4-core/src/libraries/StateLibrary.sol","lib/v4-core/src/libraries/TickMath.sol","lib/v4-core/src/types/BalanceDelta.sol","lib/v4-core/src/types/BeforeSwapDelta.sol","lib/v4-core/src/types/Currency.sol","lib/v4-core/src/types/PoolId.sol","lib/v4-core/src/types/PoolKey.sol","lib/v4-core/src/types/PoolOperation.sol"],"versionRequirement":"^0.8.26","artifacts":{"PoolUtils":{"0.8.26":{"default":{"path":"PoolUtils.sol/PoolUtils.json","build_id":"1d7b5b038af6b622"}}}},"seenByCompiler":true}},"builds":["1d7b5b038af6b622","742c9357206a65dd","9c46e186f26e3634","ab21b11005cd0c73","ae88cb63fed338ea","dc2bac586aec4911"],"profiles":{"default":{"solc":{"optimizer":{"enabled":false,"runs":200},"metadata":{"useLiteralContent":false,"bytecodeHash":"ipfs","appendCBOR":true},"outputSelection":{"*":{"*":["abi","evm.bytecode.object","evm.bytecode.sourceMap","evm.bytecode.linkReferences","evm.deployedBytecode.object","evm.deployedBytecode.sourceMap","evm.deployedBytecode.linkReferences","evm.deployedBytecode.immutableReferences","evm.methodIdentifiers","metadata"]}},"evmVersion":"cancun","viaIR":true,"libraries":{}},"vyper":{"evmVersion":"cancun","outputSelection":{"*":{"*":["abi","evm.bytecode","evm.deployedBytecode"]}}}}},"preprocessed":false,"mocks":[]}
+</file>
+
+<file path="script/utils/BasePoolScript.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Script} from "forge-std/Script.sol";
+import {StdCheats} from "forge-std/StdCheats.sol";
+
+import {UniversalRouter} from "@uniswap/universal-router/contracts/UniversalRouter.sol";
+import {IPermit2} from "@uniswap/permit2/src/interfaces/IPermit2.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+
+import {CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+
+abstract contract BasePoolScript is Script, StdCheats {
+    using CurrencyLibrary for Currency;
+
+    address internal constant DEFAULT_UNIVERSAL_ROUTER = 0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B;
+    address internal constant DEFAULT_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
+    struct Config {
+        UniversalRouter router;
+        IPoolManager poolManager;
+        IPermit2 permit2;
+        address tokenA;
+        address tokenB;
+        address hook;
+        uint24 lpFee;
+        int24 tickSpacing;
+        int24 targetTick;
+        uint128 amountIn;
+        uint128 minAmountOut;
+        uint256 deadlineBufferSeconds;
+        uint256 broadcasterKey;
+        bytes hookData;
+        bool skipPermit2Approval;
+    }
+
+    function loadConfig() internal view returns (Config memory cfg) {
+        cfg.router = UniversalRouter(payable(vm.envOr("UNIVERSAL_ROUTER", DEFAULT_UNIVERSAL_ROUTER)));
+        cfg.poolManager = IPoolManager(vm.envAddress("POOL_MANAGER"));
+        cfg.permit2 = IPermit2(vm.envOr("PERMIT2", DEFAULT_PERMIT2));
+
+        cfg.tokenA = address(0);
+        cfg.tokenB = address(0);
+        cfg.hook = address(0);
+        cfg.lpFee = 0;
+        cfg.tickSpacing = 0;
+        cfg.targetTick = type(int24).min;
+        cfg.amountIn = 0;
+        cfg.minAmountOut = 0;
+        cfg.deadlineBufferSeconds = vm.envOr("DEADLINE_BUFFER_SECONDS", uint256(300));
+        cfg.broadcasterKey = vm.envOr("PRIVATE_KEY", uint256(0));
+        cfg.skipPermit2Approval = vm.envOr("SKIP_PERMIT2_APPROVAL", false);
+        cfg.hookData = vm.envOr("HOOK_DATA", bytes(""));
+
+        require(address(cfg.poolManager) != address(0), "POOL_MANAGER unset");
+
+        return cfg;
+    }
+
+    function buildPoolKey(Config memory cfg) internal pure returns (PoolKey memory key) {
+        Currency currencyA = Currency.wrap(cfg.tokenA);
+        Currency currencyB = Currency.wrap(cfg.tokenB);
+
+        (Currency currency0, Currency currency1) =
+            Currency.unwrap(currencyA) < Currency.unwrap(currencyB) ? (currencyA, currencyB) : (currencyB, currencyA);
+
+        key = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: cfg.lpFee,
+            tickSpacing: cfg.tickSpacing,
+            hooks: IHooks(cfg.hook)
+        });
+    }
+
+    function toUint24(uint256 value) internal pure returns (uint24) {
+        require(value <= type(uint24).max, "uint24 overflow");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint24(value);
+    }
+
+    function toUint128(uint256 value) internal pure returns (uint128) {
+        require(value <= type(uint128).max, "uint128 overflow");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint128(value);
+    }
+
+    function toInt24(int256 value) internal pure returns (int24) {
+        require(value >= type(int24).min && value <= type(int24).max, "int24 overflow");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int24(value);
+    }
+}
+</file>
+
+<file path="script/utils/PoolIntrospection.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Vm} from "forge-std/Vm.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+
+import {PoolUtils} from "src/utils/PoolUtils.sol";
+
+library PoolIntrospection {
+    struct PoolData {
+        PoolKey key;
+        PoolUtils.PoolSnapshot snapshot;
+        PoolUtils.TokenMetadata token0;
+        PoolUtils.TokenMetadata token1;
+        PoolUtils.PriceInfo priceInfo;
+        uint160 initSqrtPriceX96;
+        int24 initTick;
+        uint256 initBlockNumber;
+        bytes32 initTransactionHash;
+    }
+
+    function fetch(Vm vm, IPoolManager poolManager, bytes32 poolId, uint256 fromBlock, uint256 toBlock)
+        internal
+        view
+        returns (PoolData memory data)
+    {
+        bytes32 initializeTopic = keccak256("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)");
+
+        bytes32[] memory topics = new bytes32[](2);
+        topics[0] = initializeTopic;
+        topics[1] = poolId;
+
+        Vm.EthGetLogs[] memory logs = vm.eth_getLogs(fromBlock, toBlock, address(poolManager), topics);
+        require(logs.length > 0, "Initialize event not found");
+
+        Vm.EthGetLogs memory initLog = logs[0];
+        for (uint256 i = 1; i < logs.length; i++) {
+            if (logs[i].blockNumber < initLog.blockNumber) {
+                initLog = logs[i];
+            }
+        }
+
+        address currency0Addr = address(uint160(uint256(initLog.topics[2])));
+        address currency1Addr = address(uint160(uint256(initLog.topics[3])));
+
+        (uint24 fee, int24 tickSpacing, address hooksAddr, uint160 sqrtPriceX96Init, int24 tickInit) =
+            abi.decode(initLog.data, (uint24, int24, address, uint160, int24));
+
+        data.key = PoolKey({
+            currency0: Currency.wrap(currency0Addr),
+            currency1: Currency.wrap(currency1Addr),
+            fee: fee,
+            tickSpacing: tickSpacing,
+            hooks: IHooks(hooksAddr)
+        });
+
+        (
+            PoolUtils.PoolSnapshot memory snapshot,
+            PoolUtils.TokenMetadata memory token0Meta,
+            PoolUtils.TokenMetadata memory token1Meta,
+            PoolUtils.PriceInfo memory priceInfo
+        ) = PoolUtils.summarizePool(poolManager, data.key);
+
+        data.snapshot = snapshot;
+        data.token0 = token0Meta;
+        data.token1 = token1Meta;
+        data.priceInfo = priceInfo;
+        data.initSqrtPriceX96 = sqrtPriceX96Init;
+        data.initTick = tickInit;
+        data.initBlockNumber = uint256(initLog.blockNumber);
+        data.initTransactionHash = initLog.transactionHash;
+    }
+}
+</file>
+
+<file path="script/utils/PoolReporter.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {console2} from "forge-std/console2.sol";
+
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+
+import {PoolUtils} from "src/utils/PoolUtils.sol";
+
+library PoolReporter {
+    function logTokenInfo(string memory label, PoolUtils.TokenMetadata memory meta) internal pure {
+        console2.log(string.concat(label, " address"), meta.token);
+        console2.log(string.concat(label, " symbol"), meta.symbol);
+        if (bytes(meta.name).length != 0) {
+            console2.log(string.concat(label, " name"), meta.name);
+        }
+        console2.log(string.concat(label, " decimals"), uint256(meta.decimals));
+    }
+
+    function logSnapshot(
+        string memory label,
+        PoolUtils.PoolSnapshot memory snapshot,
+        PoolUtils.PriceInfo memory price,
+        PoolUtils.TokenMetadata memory token0,
+        PoolUtils.TokenMetadata memory token1,
+        uint8 precision
+    ) internal pure {
+        console2.log(string.concat(label, " tick"), snapshot.tick);
+        console2.log(string.concat(label, " sqrtPriceX96"), uint256(snapshot.sqrtPriceX96));
+        console2.log(string.concat(label, " liquidity"), uint256(snapshot.liquidity));
+        console2.log(string.concat(label, " protocolFee"), snapshot.protocolFee);
+        console2.log(string.concat(label, " lpFee"), snapshot.lpFee);
+        console2.log(string.concat(label, " poolId (bytes32)"));
+        console2.logBytes32(PoolId.unwrap(snapshot.id));
+
+        console2.log(PoolUtils.formatPriceLine(token0, token1, price.price1Per0E18, precision));
+        console2.log(PoolUtils.formatPriceLine(token1, token0, price.price0Per1E18, precision));
+    }
+}
+</file>
+
+<file path="script/utils/PoolTargetLib.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {console2} from "forge-std/console2.sol";
+import {Vm} from "forge-std/Vm.sol";
+
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
+import {PoolUtils} from "src/utils/PoolUtils.sol";
+
+library PoolTargetLib {
+    struct TargetResult {
+        bool hasTarget;
+        int24 targetTick;
+        uint160 targetSqrtPriceX96;
+        uint256 inputAmount;
+        uint256 outputAmount;
+        bool zeroForOne;
+    }
+
+    uint256 private constant Q96 = 1 << 96;
+    uint256 private constant Q192 = 1 << 192;
+
+    function promptTargetPrice(
+        Vm vm,
+        PoolUtils.TokenMetadata memory token0,
+        PoolUtils.TokenMetadata memory token1,
+        PoolUtils.PoolSnapshot memory snapshot,
+        int24 initialTick
+    ) internal returns (TargetResult memory result) {
+        string memory forwardPrompt = string(
+            abi.encodePacked(
+                "Target price ",
+                token0.symbol,
+                "/",
+                token1.symbol,
+                " (",
+                token1.symbol,
+                " per ",
+                token0.symbol,
+                "). Leave blank to skip"
+            )
+        );
+
+        string memory directInput = _prompt(vm, forwardPrompt);
+        if (bytes(directInput).length > 0) {
+            (uint256 num, uint256 den) = _parseDecimal(directInput);
+            return _targetFromPrice(token0, token1, snapshot, num, den);
+        }
+
+        string memory inversePrompt = string(
+            abi.encodePacked(
+                "Target price ",
+                token1.symbol,
+                "/",
+                token0.symbol,
+                " (",
+                token0.symbol,
+                " per ",
+                token1.symbol,
+                "). Leave blank to skip"
+            )
+        );
+        string memory inverseInput = _prompt(vm, inversePrompt);
+        if (bytes(inverseInput).length > 0) {
+            (uint256 inverseNum, uint256 inverseDen) = _parseDecimal(inverseInput);
+            return _targetFromPrice(token0, token1, snapshot, inverseDen, inverseNum);
+        }
+
+        console2.log("No target price provided. Current tick:", initialTick);
+        return result;
+    }
+
+    function targetFromTick(PoolUtils.PoolSnapshot memory snapshot, int24 targetTick)
+        internal
+        pure
+        returns (TargetResult memory result)
+    {
+        uint160 sqrtTarget = TickMath.getSqrtPriceAtTick(targetTick);
+        return _buildResult(snapshot, targetTick, sqrtTarget);
+    }
+
+    function logTarget(
+        TargetResult memory result,
+        PoolUtils.TokenMetadata memory token0,
+        PoolUtils.TokenMetadata memory token1
+    ) internal pure {
+        console2.log("Target tick              :", result.targetTick);
+        console2.log("Target sqrtPriceX96      :", uint256(result.targetSqrtPriceX96));
+        (string memory forward, string memory inverse) =
+            PoolUtils.tickToPriceStrings(result.targetTick, token0, token1, 6);
+        console2.log(forward);
+        console2.log(inverse);
+
+        if (!result.hasTarget || result.inputAmount == 0) {
+            console2.log("Pool already at target price.");
+            return;
+        }
+
+        if (result.zeroForOne) {
+            console2.log("Swap direction        :", string(abi.encodePacked(token0.symbol, " -> ", token1.symbol)));
+            console2.log("Input amount (raw)    :", result.inputAmount);
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Input amount (~)     : ",
+                        PoolUtils.amountToString(result.inputAmount, token0.decimals, 6),
+                        " ",
+                        token0.symbol
+                    )
+                )
+            );
+            console2.log("Expected output (raw) :", result.outputAmount);
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Expected output (~)  : ",
+                        PoolUtils.amountToString(result.outputAmount, token1.decimals, 6),
+                        " ",
+                        token1.symbol
+                    )
+                )
+            );
+        } else {
+            console2.log("Swap direction        :", string(abi.encodePacked(token1.symbol, " -> ", token0.symbol)));
+            console2.log("Input amount (raw)    :", result.inputAmount);
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Input amount (~)     : ",
+                        PoolUtils.amountToString(result.inputAmount, token1.decimals, 6),
+                        " ",
+                        token1.symbol
+                    )
+                )
+            );
+            console2.log("Expected output (raw) :", result.outputAmount);
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Expected output (~)  : ",
+                        PoolUtils.amountToString(result.outputAmount, token0.decimals, 6),
+                        " ",
+                        token0.symbol
+                    )
+                )
+            );
+        }
+    }
+
+    function toInt24(int256 value) internal pure returns (int24) {
+        require(value >= type(int24).min && value <= type(int24).max, "int24 overflow");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int24(value);
+    }
+
+    function _targetFromPrice(
+        PoolUtils.TokenMetadata memory token0,
+        PoolUtils.TokenMetadata memory token1,
+        PoolUtils.PoolSnapshot memory snapshot,
+        uint256 priceNum,
+        uint256 priceDen
+    ) private pure returns (TargetResult memory result) {
+        require(priceNum > 0 && priceDen > 0, "invalid price");
+        (int24 tickTarget, uint160 sqrtPriceTarget) =
+            _computeTickFromPrice(priceNum, priceDen, token0.decimals, token1.decimals);
+        return _buildResult(snapshot, tickTarget, sqrtPriceTarget);
+    }
+
+    function _buildResult(PoolUtils.PoolSnapshot memory snapshot, int24 targetTick, uint160 targetSqrtPriceX96)
+        private
+        pure
+        returns (TargetResult memory result)
+    {
+        result.hasTarget = true;
+        result.targetTick = targetTick;
+        result.targetSqrtPriceX96 = targetSqrtPriceX96;
+
+        uint160 sqrtCurrent = snapshot.sqrtPriceX96;
+        if (targetSqrtPriceX96 == sqrtCurrent) {
+            return result;
+        }
+
+        uint256 liquidity = uint256(snapshot.liquidity);
+        if (targetSqrtPriceX96 < sqrtCurrent) {
+            result.zeroForOne = true;
+            uint256 numerator = FullMath.mulDiv(
+                liquidity << 96, sqrtCurrent - targetSqrtPriceX96, uint256(targetSqrtPriceX96) * sqrtCurrent
+            );
+            uint256 output = FullMath.mulDiv(liquidity, sqrtCurrent - targetSqrtPriceX96, Q96);
+            result.inputAmount = numerator;
+            result.outputAmount = output;
+        } else {
+            result.zeroForOne = false;
+            uint256 input = FullMath.mulDiv(liquidity, targetSqrtPriceX96 - sqrtCurrent, Q96);
+            uint256 output = FullMath.mulDiv(
+                liquidity << 96, targetSqrtPriceX96 - sqrtCurrent, uint256(targetSqrtPriceX96) * sqrtCurrent
+            );
+            result.inputAmount = input;
+            result.outputAmount = output;
+        }
+    }
+
+    function _computeTickFromPrice(uint256 priceNum, uint256 priceDen, uint8 decimals0, uint8 decimals1)
+        private
+        pure
+        returns (int24 tick, uint160 sqrtPriceX96)
+    {
+        uint256 scale0 = _pow10(decimals0);
+        uint256 scale1 = _pow10(decimals1);
+
+        uint256 ratioNumerator = priceNum * scale1;
+        require(ratioNumerator / scale1 == priceNum, "ratio overflow");
+        uint256 ratioDenominator = priceDen * scale0;
+        require(ratioDenominator / scale0 == priceDen, "ratio overflow");
+
+        uint256 value = FullMath.mulDiv(ratioNumerator, Q192, ratioDenominator);
+        uint256 sqrtValue = Math.sqrt(value);
+        require(sqrtValue >= TickMath.MIN_SQRT_PRICE, "price below bounds");
+        require(sqrtValue <= TickMath.MAX_SQRT_PRICE, "price above bounds");
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        sqrtPriceX96 = uint160(sqrtValue);
+        tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+    }
+
+    function _prompt(Vm vm, string memory message) private returns (string memory value) {
+        try vm.prompt(message) returns (string memory input) {
+            return input;
+        } catch (bytes memory) {
+            return "";
+        }
+    }
+
+    function _parseDecimal(string memory input) private pure returns (uint256 numerator, uint256 denominator) {
+        bytes memory data = bytes(input);
+        require(data.length > 0, "empty input");
+
+        bool seenDot = false;
+        uint8 decimalsCount = 0;
+
+        for (uint256 i = 0; i < data.length; i++) {
+            bytes1 char = data[i];
+            if (char == ".") {
+                require(!seenDot, "multiple decimal points");
+                seenDot = true;
+            } else {
+                require(char >= "0" && char <= "9", "invalid character");
+                uint256 digit = uint8(char) - 48;
+                numerator = numerator * 10 + digit;
+                if (seenDot) {
+                    decimalsCount++;
+                }
+            }
+        }
+
+        require(numerator > 0, "zero value");
+        require(decimalsCount <= 18, "too many decimals");
+
+        denominator = decimalsCount == 0 ? 1 : _pow10(decimalsCount);
+    }
+
+    function _pow10(uint8 exponent) private pure returns (uint256) {
+        require(exponent <= 38, "exponent too large");
+        uint256 result = 1;
+        for (uint8 i = 0; i < exponent; i++) {
+            result *= 10;
+        }
+        return result;
+    }
+}
+</file>
+
+<file path="script/AdjustPoolPrice.s.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {console2} from "forge-std/console2.sol";
+
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.sol";
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+
+import {PoolUtils} from "src/utils/PoolUtils.sol";
+import {PoolReporter} from "./utils/PoolReporter.sol";
+import {PoolIntrospection} from "./utils/PoolIntrospection.sol";
+import {PoolTargetLib} from "./utils/PoolTargetLib.sol";
+import {BasePoolScript} from "./utils/BasePoolScript.sol";
+
+contract AdjustPoolPriceScript is BasePoolScript {
+    uint160 private constant PERMIT2_MAX_AMOUNT = type(uint160).max;
+    uint48 private constant PERMIT2_MAX_EXPIRATION = type(uint48).max;
+    uint256 private constant SLIPPAGE_BASIS = 995_000; // 0.5% buffer on expected output
+
+    function run(bytes32 poolIdInput, int24 targetTickInput) external {
+        Config memory cfg = loadConfig();
+        require(cfg.broadcasterKey != 0, "PRIVATE_KEY unset");
+
+        bytes32 poolId = poolIdInput;
+        if (poolId == bytes32(0)) {
+            poolId = vm.envBytes32("POOL_ID");
+        }
+        require(poolId != bytes32(0), "poolId required");
+        require(targetTickInput != type(int24).min, "target tick required");
+
+        uint256 fromBlock = vm.envOr("LOG_FROM_BLOCK", uint256(0));
+        uint256 defaultToBlock = block.number;
+        if (defaultToBlock == 0) {
+            defaultToBlock = fromBlock == 0 ? 50_000_000 : fromBlock + 5_000_000;
+        }
+        uint256 toBlock = vm.envOr("LOG_TO_BLOCK", defaultToBlock);
+        if (toBlock == 0) {
+            toBlock = defaultToBlock;
+        }
+
+        PoolIntrospection.PoolData memory data =
+            PoolIntrospection.fetch(vm, cfg.poolManager, poolId, fromBlock, toBlock);
+
+        cfg.tokenA = data.token0.token;
+        cfg.tokenB = data.token1.token;
+        cfg.lpFee = data.key.fee;
+        cfg.tickSpacing = data.key.tickSpacing;
+        cfg.hook = address(data.key.hooks);
+
+        PoolReporter.logTokenInfo("Token0", data.token0);
+        PoolReporter.logTokenInfo("Token1", data.token1);
+        PoolReporter.logSnapshot("Before swap", data.snapshot, data.priceInfo, data.token0, data.token1, 6);
+
+        PoolTargetLib.TargetResult memory target = PoolTargetLib.targetFromTick(data.snapshot, targetTickInput);
+        PoolTargetLib.logTarget(target, data.token0, data.token1);
+
+        if (target.inputAmount == 0) {
+            console2.log("Target already met - no swap required.");
+            return;
+        }
+
+        bool dryRun = vm.envOr("DRY_RUN", false);
+
+        PoolUtils.TokenMetadata memory inputMeta = target.zeroForOne ? data.token0 : data.token1;
+        PoolUtils.TokenMetadata memory outputMeta = target.zeroForOne ? data.token1 : data.token0;
+        PoolKey memory key = data.key;
+        Currency inputCurrency = target.zeroForOne ? key.currency0 : key.currency1;
+        address owner = vm.addr(cfg.broadcasterKey);
+
+        uint256 amountInWithFee = target.inputAmount;
+        if (cfg.lpFee > 0) {
+            amountInWithFee = FullMath.mulDiv(target.inputAmount, 1_000_000 + cfg.lpFee, 1_000_000);
+            if (amountInWithFee <= target.inputAmount) {
+                amountInWithFee = target.inputAmount + 1;
+            }
+        }
+
+        uint256 availableBalance = _balanceOf(owner, inputCurrency);
+        if (availableBalance < amountInWithFee) {
+            uint256 deficit = amountInWithFee - availableBalance;
+            string memory shortfallHuman = PoolUtils.amountToString(deficit, inputMeta.decimals, 6);
+
+            console2.log("----------------------------------------------");
+            console2.log("Insufficient input token balance detected.");
+            console2.log(string(abi.encodePacked(" Wallet   : ", vm.toString(owner))));
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        " Missing  : ", vm.toString(deficit), " (", shortfallHuman, " ", inputMeta.symbol, ")"
+                    )
+                )
+            );
+            console2.log("----------------------------------------------");
+
+            // Auto-top-up for simulation / testing convenience.
+            uint256 toppedBalance;
+            if (Currency.unwrap(inputCurrency) == address(0)) {
+                toppedBalance = owner.balance + deficit;
+                vm.deal(owner, toppedBalance);
+            } else {
+                toppedBalance = IERC20(Currency.unwrap(inputCurrency)).balanceOf(owner) + deficit;
+                deal(Currency.unwrap(inputCurrency), owner, toppedBalance);
+            }
+
+            availableBalance = _balanceOf(owner, inputCurrency);
+            if (availableBalance < amountInWithFee) {
+                console2.log("Unable to top up automatically. Please fund the wallet manually.");
+                return;
+            }
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Wallet topped up to ",
+                        vm.toString(availableBalance),
+                        " (",
+                        PoolUtils.amountToString(availableBalance, inputMeta.decimals, 6),
+                        " ",
+                        inputMeta.symbol,
+                        ") for simulation."
+                    )
+                )
+            );
+        }
+
+        uint128 amountIn = toUint128(amountInWithFee);
+        uint128 amountOutMin = target.outputAmount == 0
+            ? uint128(0)
+            : toUint128(FullMath.mulDiv(target.outputAmount, SLIPPAGE_BASIS, 1_000_000));
+
+        console2.log("Buffered input (raw)     :", amountIn);
+        if (target.zeroForOne) {
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Buffered input (~)      : ",
+                        PoolUtils.amountToString(amountIn, inputMeta.decimals, 6),
+                        " ",
+                        inputMeta.symbol
+                    )
+                )
+            );
+        } else {
+            console2.log(
+                string(
+                    abi.encodePacked(
+                        "Buffered input (~)      : ",
+                        PoolUtils.amountToString(amountIn, inputMeta.decimals, 6),
+                        " ",
+                        inputMeta.symbol
+                    )
+                )
+            );
+        }
+
+        console2.log("Min amount out (raw)     :", amountOutMin);
+        console2.log(
+            string(
+                abi.encodePacked(
+                    "Min amount out (~)      : ",
+                    PoolUtils.amountToString(amountOutMin, outputMeta.decimals, 6),
+                    " ",
+                    outputMeta.symbol
+                )
+            )
+        );
+
+        cfg.targetTick = target.targetTick;
+        cfg.amountIn = amountIn;
+        cfg.minAmountOut = amountOutMin;
+
+        vm.startBroadcast(cfg.broadcasterKey);
+
+        if (!cfg.skipPermit2Approval) {
+            approveIfNeeded(cfg, inputCurrency, amountInWithFee);
+        }
+
+        executeSwap(cfg, key, target.zeroForOne, amountIn, amountOutMin);
+
+        (
+            PoolUtils.PoolSnapshot memory finalSnapshot,
+            PoolUtils.TokenMetadata memory token0Meta,
+            PoolUtils.TokenMetadata memory token1Meta,
+            PoolUtils.PriceInfo memory finalPriceInfo
+        ) = PoolUtils.summarizePool(cfg.poolManager, key);
+
+        PoolReporter.logSnapshot("After swap", finalSnapshot, finalPriceInfo, token0Meta, token1Meta, 6);
+
+        vm.stopBroadcast();
+
+        if (dryRun) {
+            console2.log("Dry run complete - no on-chain broadcast.");
+        }
+    }
+
+    function approveIfNeeded(Config memory cfg, Currency currency, uint256 requiredAmount) internal {
+        address token = Currency.unwrap(currency);
+        if (token == address(0)) {
+            return;
+        }
+
+        IERC20 erc20 = IERC20(token);
+        address owner = vm.addr(cfg.broadcasterKey);
+        if (erc20.allowance(owner, address(cfg.permit2)) < requiredAmount) {
+            erc20.approve(address(cfg.permit2), type(uint256).max);
+        }
+
+        cfg.permit2.approve(token, address(cfg.router), PERMIT2_MAX_AMOUNT, PERMIT2_MAX_EXPIRATION);
+    }
+
+    function executeSwap(
+        Config memory cfg,
+        PoolKey memory key,
+        bool zeroForOne,
+        uint128 amountIn,
+        uint128 amountOutMinimum
+    ) internal {
+        Currency outputCurrency = zeroForOne ? key.currency1 : key.currency0;
+        Currency inputCurrency = zeroForOne ? key.currency0 : key.currency1;
+
+        bytes memory subActions =
+            abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL));
+
+        bytes[] memory subParams = new bytes[](3);
+        subParams[0] = abi.encode(
+            IV4Router.ExactInputSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMinimum,
+                hookData: cfg.hookData
+            })
+        );
+
+        subParams[1] = abi.encode(inputCurrency, uint256(amountIn));
+        subParams[2] = abi.encode(outputCurrency, uint256(amountOutMinimum));
+
+        bytes memory commands = abi.encodePacked(uint8(Commands.EXECUTE_SUB_PLAN));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(subActions, subParams);
+
+        uint256 deadline = block.timestamp + cfg.deadlineBufferSeconds;
+        uint256 valueToSend = Currency.unwrap(inputCurrency) == address(0) ? amountIn : 0;
+        cfg.router.execute{value: valueToSend}(commands, inputs, deadline);
+    }
+
+    function _balanceOf(address owner, Currency currency) private view returns (uint256) {
+        address token = Currency.unwrap(currency);
+        if (token == address(0)) {
+            return owner.balance;
+        }
+        return IERC20(token).balanceOf(owner);
+    }
+}
+</file>
+
+<file path="script/ViewPoolState.s.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {console2} from "forge-std/console2.sol";
+import {Script} from "forge-std/Script.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+
+import {PoolReporter} from "./utils/PoolReporter.sol";
+import {PoolIntrospection} from "./utils/PoolIntrospection.sol";
+import {PoolTargetLib} from "./utils/PoolTargetLib.sol";
+
+contract ViewPoolStateScript is Script {
+    function run(bytes32 poolIdInput) external {
+        address poolManagerAddr = vm.envAddress("POOL_MANAGER");
+        IPoolManager manager = IPoolManager(poolManagerAddr);
+
+        bytes32 poolId = poolIdInput;
+        if (poolId == bytes32(0)) {
+            poolId = vm.envBytes32("POOL_ID");
+        }
+        require(poolId != bytes32(0), "poolId required");
+
+        uint256 fromBlock = vm.envOr("LOG_FROM_BLOCK", uint256(0));
+        uint256 defaultToBlock = block.number;
+        if (defaultToBlock == 0) {
+            defaultToBlock = fromBlock == 0 ? 50_000_000 : fromBlock + 5_000_000;
+        }
+        uint256 toBlock = vm.envOr("LOG_TO_BLOCK", defaultToBlock);
+        if (toBlock == 0) {
+            toBlock = defaultToBlock;
+        }
+
+        PoolIntrospection.PoolData memory data = PoolIntrospection.fetch(vm, manager, poolId, fromBlock, toBlock);
+
+        console2.log("Pool Initialize Event:");
+        console2.log("  poolId        :");
+        console2.logBytes32(poolId);
+        console2.log("  currency0     :", data.token0.token);
+        console2.log("  currency1     :", data.token1.token);
+        console2.log("  fee           :", data.key.fee);
+        console2.log("  tickSpacing   :", data.key.tickSpacing);
+        console2.log("  hooks         :", address(data.key.hooks));
+        console2.log("  init sqrtPriceX96 :", uint256(data.initSqrtPriceX96));
+        console2.log("  init tick     :", data.initTick);
+        console2.log("  blockNumber   :", data.initBlockNumber);
+        console2.log("  transaction   :");
+        console2.logBytes32(data.initTransactionHash);
+
+        PoolReporter.logTokenInfo("Token0", data.token0);
+        PoolReporter.logTokenInfo("Token1", data.token1);
+
+        PoolReporter.logSnapshot("Current state", data.snapshot, data.priceInfo, data.token0, data.token1, 6);
+
+        PoolTargetLib.TargetResult memory result =
+            PoolTargetLib.promptTargetPrice(vm, data.token0, data.token1, data.snapshot, data.initTick);
+
+        if (result.hasTarget) {
+            PoolTargetLib.logTarget(result, data.token0, data.token1);
+        }
+    }
+}
+</file>
+
+<file path="src/utils/PoolUtils.sol">
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+
+using PoolIdLibrary for PoolKey;
+using CurrencyLibrary for Currency;
+using StateLibrary for IPoolManager;
+
+library PoolUtils {
+    error ExponentTooLarge(uint8 exponent);
+
+    uint256 private constant Q192 = 2 ** 192;
+    uint256 private constant E18 = 1e18;
+    uint256 private constant E36 = 1e36;
+
+    struct TokenMetadata {
+        address token;
+        string symbol;
+        string name;
+        uint8 decimals;
+    }
+
+    struct PoolSnapshot {
+        PoolId id;
+        uint160 sqrtPriceX96;
+        int24 tick;
+        uint24 protocolFee;
+        uint24 lpFee;
+        uint128 liquidity;
+    }
+
+    struct PriceInfo {
+        uint256 price1Per0E18;
+        uint256 price0Per1E18;
+    }
+
+    function fetchSnapshot(IPoolManager manager, PoolKey memory key) internal view returns (PoolSnapshot memory snap) {
+        PoolId poolId = key.toId();
+        (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(poolId);
+        uint128 liquidity = manager.getLiquidity(poolId);
+
+        snap = PoolSnapshot({
+            id: poolId,
+            sqrtPriceX96: sqrtPriceX96,
+            tick: tick,
+            protocolFee: protocolFee,
+            lpFee: lpFee,
+            liquidity: liquidity
+        });
+    }
+
+    function fetchTokenMetadata(Currency currency) internal view returns (TokenMetadata memory meta) {
+        address token = Currency.unwrap(currency);
+        if (token == address(0)) {
+            meta = TokenMetadata({token: token, symbol: "ETH", name: "Ether", decimals: 18});
+            return meta;
+        }
+
+        string memory symbol = "???";
+        string memory name = "";
+        uint8 decimals = 18;
+
+        IERC20Metadata erc20 = IERC20Metadata(token);
+
+        try erc20.symbol() returns (string memory sym) {
+            symbol = sym;
+        } catch {}
+
+        try erc20.name() returns (string memory nm) {
+            name = nm;
+        } catch {}
+
+        try erc20.decimals() returns (uint8 dec) {
+            decimals = dec;
+        } catch {}
+
+        meta = TokenMetadata({token: token, symbol: symbol, name: name, decimals: decimals});
+    }
+
+    function computePrices(uint160 sqrtPriceX96, TokenMetadata memory meta0, TokenMetadata memory meta1)
+        internal
+        pure
+        returns (PriceInfo memory info)
+    {
+        if (sqrtPriceX96 == 0) {
+            return PriceInfo({price1Per0E18: 0, price0Per1E18: 0});
+        }
+
+        uint256 scale0 = pow10(meta0.decimals);
+        uint256 scale1 = pow10(meta1.decimals);
+
+        uint256 numeratorA = uint256(sqrtPriceX96) * scale0;
+        uint256 numeratorB = uint256(sqrtPriceX96) * E18;
+        uint256 denominator = Q192 * scale1;
+
+        uint256 price1Per0E18 = FullMath.mulDiv(numeratorA, numeratorB, denominator);
+        uint256 price0Per1E18 = price1Per0E18 == 0 ? 0 : FullMath.mulDiv(E36, 1, price1Per0E18);
+
+        info = PriceInfo({price1Per0E18: price1Per0E18, price0Per1E18: price0Per1E18});
+    }
+
+    function pow10(uint8 exponent) internal pure returns (uint256) {
+        if (exponent > 38) revert ExponentTooLarge(exponent);
+        uint256 result = 1;
+        for (uint8 i = 0; i < exponent; i++) {
+            result *= 10;
+        }
+        return result;
+    }
+
+    function decimalString(uint256 valueE18, uint8 precision) internal pure returns (string memory) {
+        if (precision > 18) {
+            precision = 18;
+        }
+
+        uint256 factor = 10 ** (18 - precision);
+        uint256 integerPart = valueE18 / E18;
+        uint256 truncated = valueE18 / factor;
+        uint256 fractionalPart = truncated % (10 ** precision);
+
+        string memory intStr = Strings.toString(integerPart);
+        string memory fracStr = padFraction(fractionalPart, precision);
+
+        return string(abi.encodePacked(intStr, ".", fracStr));
+    }
+
+    function padFraction(uint256 value, uint8 precision) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(precision);
+        for (uint256 i = precision; i > 0; i--) {
+            uint256 digit = value % 10;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            buffer[i - 1] = bytes1(uint8(48 + digit));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    function amountToString(uint256 amount, uint8 decimals, uint8 precision) internal pure returns (string memory) {
+        uint256 scaleDenominator = pow10(decimals);
+        uint256 scaled = scaleDenominator == 0 ? 0 : FullMath.mulDiv(amount, E18, scaleDenominator);
+        return decimalString(scaled, precision);
+    }
+
+    function formatPriceLine(TokenMetadata memory base, TokenMetadata memory quote, uint256 priceE18, uint8 precision)
+        internal
+        pure
+        returns (string memory)
+    {
+        string memory readable = decimalString(priceE18, precision);
+        return string(abi.encodePacked("1 ", base.symbol, " = ", readable, " ", quote.symbol));
+    }
+
+    function summarizePool(IPoolManager manager, PoolKey memory key)
+        internal
+        view
+        returns (
+            PoolSnapshot memory snapshot,
+            TokenMetadata memory token0,
+            TokenMetadata memory token1,
+            PriceInfo memory priceInfo
+        )
+    {
+        snapshot = fetchSnapshot(manager, key);
+        token0 = fetchTokenMetadata(key.currency0);
+        token1 = fetchTokenMetadata(key.currency1);
+        priceInfo = computePrices(snapshot.sqrtPriceX96, token0, token1);
+    }
+
+    function tickToPriceStrings(int24 tick, TokenMetadata memory token0, TokenMetadata memory token1, uint8 precision)
+        internal
+        pure
+        returns (string memory forward, string memory inverse)
+    {
+        uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);
+        PriceInfo memory info = computePrices(sqrtPrice, token0, token1);
+        forward = formatPriceLine(token0, token1, info.price1Per0E18, precision);
+        inverse = formatPriceLine(token1, token0, info.price0Per1E18, precision);
+    }
+}
+</file>
+
+<file path=".env.example">
+# Required configuration
+MAINNET_RPC_URL=https://mainnet.infura.io/v3/YOUR_KEY
+PRIVATE_KEY=0xYOUR_PRIVATE_KEY
+POOL_MANAGER=0xPOOL_MANAGER_ADDRESS
+
+# Optional overrides
+UNIVERSAL_ROUTER=0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B
+PERMIT2=0x000000000022D473030F116dDEE9F6B43aC78BA3
+HOOK_DATA=0x
+DEADLINE_BUFFER_SECONDS=300
+SKIP_PERMIT2_APPROVAL=false
+
+# Pool discovery helpers
+POOL_ID=0xPOOL_ID_BYTES32
+LOG_FROM_BLOCK=0
+LOG_TO_BLOCK=0
+
+# Notes:
+# - Pass the poolId as the first argument to bin/view.sh or bin/adjust.sh to override POOL_ID.
+# - AdjustPoolPrice prompts for a tick (or price) and computes the required swap amount automatically.
+# - Set SKIP_PERMIT2_APPROVAL=true if allowances are already in place for the input token.
+</file>
+
+<file path=".gitmodules">
+[submodule "lib/v4-core"]
+	path = lib/v4-core
+	url = https://github.com/uniswap/v4-core
+[submodule "lib/v4-periphery"]
+	path = lib/v4-periphery
+	url = https://github.com/uniswap/v4-periphery
+[submodule "lib/permit2"]
+	path = lib/permit2
+	url = https://github.com/uniswap/permit2
+[submodule "lib/universal-router"]
+	path = lib/universal-router
+	url = https://github.com/uniswap/universal-router
+[submodule "lib/forge-std"]
+	path = lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "lib/v3-core"]
+	path = lib/v3-core
+	url = https://github.com/uniswap/v3-core
+[submodule "lib/v2-core"]
+	path = lib/v2-core
+	url = https://github.com/uniswap/v2-core
+[submodule "lib/openzeppelin-contracts"]
+	path = lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+</file>
+
+<file path="docs.md">
+## Usage Overview
+
+1. Copy `.env.example` to `.env` and fill in:  
+   - Always: `MAINNET_RPC_URL`, `POOL_MANAGER`.  
+   - For price adjustment: also provide `PRIVATE_KEY`, `POOL_TOKEN_A`, `POOL_TOKEN_B`, `POOL_FEE`, `POOL_TICK_SPACING`, `TARGET_TICK`, `SWAP_AMOUNT_IN`.  
+   - Optional quality-of-life overrides are listed in the template (router addresses, hook data, deadline buffer, etc.).
+2. If you only know the `poolId`, set `POOL_ID` and optionally `LOG_FROM_BLOCK` / `LOG_TO_BLOCK`.  
+   - Use `bin/pool-key.sh <poolId>` to automatically decode the `Initialize` event and recover the full `PoolKey`.
+3. Inspect current pool state without mutating anything:
+   ```
+   bin/view.sh 0xd098a1b12d545657bf587313c2dafbec0958cc6f110376ce31fdef86d1d213b1
+   ```
+   (omit the argument to fall back to `POOL_ID` in `.env`). The script retrieves the `Initialize` event via `eth_getLogs`, prints live pool data, and then prompts for a target price. Provide either the forward quote (`token0/token1`) or, by hitting enter, the inverse quote. It parses the decimal string, computes the implied tick, and shows the swap direction and required input/output amounts to reach that price.
+4. Shift the price before providing liquidity:
+   ```
+   bin/adjust.sh 0xd098a1b12d545657bf587313c2dafbec0958cc6f110376ce31fdef86d1d213b1 --fork-url $MAINNET_RPC_URL
+   bin/adjust.sh 0xd098a1b12d545657bf587313c2dafbec0958cc6f110376ce31fdef86d1d213b1 --broadcast --rpc-url $MAINNET_RPC_URL
+   ```
+   The helper prompts for a target tick (press enter to supply one manually). It first runs a forked dry run (no approvals or swaps) to print the projected direction and input/output amounts, then asks for confirmation before broadcasting the same plan on mainnet. Review the before/after snapshots to confirm the result.
+
+# Swap | Uniswap
+
+Source: https://docs.uniswap.org/contracts/v4/quickstart/swap
+
+SwapSwapping on Uniswap v4​ The Universal Router is a flexible, gas-efficient contract designed to execute complex swap operations across various protocols, including Uniswap v4. It serves as an intermediary between users and the Uniswap v4 PoolManager, handling the intricacies of swap execution. Although it's technically possible to interact directly with the PoolManager contract for swaps, this approach is not recommended due to its complexity and potential inefficiencies. Instead, the Universal Router is the preferred method, as it abstracts away these complexities. By using the Universal Router, developers and users can ensure a more straightforward, efficient, and standardized approach to executing swaps on v4 pools, aligning with best practices for Uniswap interactions. Configuring Universal Router for Uniswap v4 Swaps​ Set up a foundry project and install the necessary dependencies: forge install uniswap/v4-coreforge install uniswap/v4-peripheryforge install uniswap/permit2forge install uniswap/universal-routerforge install uniswap/v3-coreforge install uniswap/v2-coreforge install OpenZeppelin/openzeppelin-contracts In the remappings.txt, add the following: @uniswap/v4-core/=lib/v4-core/@uniswap/v4-periphery/=lib/v4-periphery/@uniswap/permit2/=lib/permit2/@uniswap/universal-router/=lib/universal-router/@uniswap/v3-core/=lib/v3-core/@uniswap/v2-core/=lib/v2-core/@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/[...] Step 1: Set Up the Project​ First, we need to set up our project and import the necessary dependencies. We'll create a new Solidity contract for our example. // SPDX-License-Identifier: MITpragma solidity 0.8.26;import { UniversalRouter } from "@uniswap/universal-router/contracts/UniversalRouter.sol";import { Commands } from "@uniswap/universal-router/contracts/libraries/Commands.sol";import { IPoolManager } from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";import { IV4Router } from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";import { Actions } from "@uniswap/v4-periphery/src/libraries/Actions.sol";import { IPermit2 } from "@uniswap/permit2/src/interfaces/IPermit2.sol";import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";import { StateLibrary } from "@uniswap/v4-core/src/libraries/StateLibrary.sol";contract Example { using StateLibrary for IPoolManager; UniversalRouter public immutable router; IPoolManager public immutable poolManager; IPermit2 public immutable permit2; constructor(address _router, address _poolManager, address _permit2) { router = UniversalRouter(payable(_router)); poolManager = IPoolManager(_poolManager); permit2 = IPermit2(_permit2); } // We'll add more functions here} In this step, we're importing the necessary contracts and interfaces: UniversalRouter: This will be our main interface for executing swaps. It provides a flexible way to interact with various Uniswap versions and other protocols. Commands: This library contains the command definitions used by the UniversalRouter. IPoolManager: This interface is needed for interacting with Uniswap v4 pools. While we don't directly use it in our simple example, it's often necessary for more complex interactions with v4 pools. IPermit2: This interface allows us to interact with the Permit2 contract, which provides enhanced token approval functionality. StateLibrary: This provides optimized functions for interacting with the PoolManager's state. By using StateLibrary, we can more efficiently read and manipulate pool states, which is crucial for many operations in Uniswap v4. Step 2: Implement Token Approval with Permit2​ UniversalRouter integrates with Permit2, to enable users to have more safety, flexibility, and control over their ERC20 token approvals. Before we can execute swaps, we need to ensure our contract can transfer tokens. We’ll implement a function to approve the Universal Router to spend tokens on behalf of our contract. Here, for testing purposes, we set up our contract to use Permit2 with the UniversalRouter: function approveTokenWithPermit2( address token, uint160 amount, uint48 expiration) external { IERC20(token).approve(address(permit2), type(uint256).max); permit2.approve(token, address(router), amount, expiration);} This function first approves Permit2 to spend the token, then uses Permit2 to approve the UniversalRouter with a specific amount and expiration time. Step 3: Implementing a Swap Function​ 3.1: Function Signature​ First, let’s define our function signature: function swapExactInputSingle( PoolKey calldata key, // PoolKey struct that identifies the v4 pool uint128 amountIn, // Exact amount of tokens to swap uint128 minAmountOut, // Minimum amount of output tokens expected uint256 deadline // Timestamp after which the transaction will revert) external returns (uint256 amountOut) { // Implementation will follow} Important note: The deadline parameter allows users to specify when their transaction should expire. This protects against unfavorable execution due to network delays or MEV attacks. When swapping tokens involving native ETH, we use Currency.wrap(address(0)) to represent ETH in the PoolKey struct. struct PoolKey { /// @notice The lower currency of the pool, sorted numerically. /// For native ETH, Currency currency0 = Currency.wrap(address(0)); Currency currency0; /// @notice The higher currency of the pool, sorted numerically Currency currency1; /// @notice The pool LP fee, capped at 1_000_000. If the highest bit is 1, the pool has a dynamic fee and must be exactly equal to 0x800000 uint24 fee; /// @notice Ticks that involve positions must be a multiple of tick spacing int24 tickSpacing; /// @notice The hooks of the pool IHooks hooks;} 3.2: Encoding the Swap Command​ When encoding a swap command for the Universal Router, we need to choose between two types of swaps: Exact Input Swaps: Use this swap-type when you know the exact amount of tokens you want to swap in, and you're willing to accept any amount of output tokens above your minimum. This is common when you want to sell a specific amount of tokens. Exact Output Swaps: Use this swap-type when you need a specific amount of output tokens, and you're willing to spend up to a maximum amount of input tokens. This is useful when you need to acquire a precise amount of tokens, for example, to repay a loan or meet a specific requirement. Next, we encode the swap command: bytes memory commands = abi.encodePacked(uint8(Commands.V4_SWAP)); Here, we're using V4_SWAP, which tells the Universal Router that we want to perform a swap on a Uniswap v4 pool. The specific type of swap (exact input or exact output) will be determined by the V4Router actions we encode later. As we saw earlier, we encode this as a single byte, which is how the Universal Router expects to receive commands. Check the complete list of commands. 3.3: Action Encoding​ Now, let’s encode the actions for the swap: // Encode V4Router actionsbytes memory actions = abi.encodePacked( uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL)); These actions define the sequence of operations that will be performed in our v4 swap: SWAP_EXACT_IN_SINGLE: This action specifies that we want to perform an exact input swap using a single pool. SETTLE_ALL: This action ensures all input tokens involved in the swap are properly paid. This is part of v4's settlement pattern for handling token transfers. TAKE_ALL: This final action collects all output tokens after the swap is complete. The sequence of these actions is important as they define the complete flow of our swap operation from start to finish. 3.4: Preparing the Swap Inputs​ For our v4 swap, we need to prepare three parameters that correspond to our encoded actions: bytes[] memory params = new bytes[](3);// First parameter: swap configurationparams[0] = abi.encode( IV4Router.ExactInputSingleParams({ poolKey: key, zeroForOne: true, // true if we're swapping token0 for token1 amountIn: amountIn, // amount of tokens we're swapping amountOutMinimum: minAmountOut, // minimum amount we expect to receive hookData: bytes("") // no hook data needed }));// Second parameter: specify input tokens for the swap// encode SETTLE_ALL parametersparams[1] = abi.encode(key.currency0, amountIn);// Third parameter: specify output tokens from the swapparams[2] = abi.encode(key.currency1, minAmountOut); Each encoded parameter corresponds to a specific action in our swap: The first parameter configures how the swap should be executed, defining the pool, amounts, and other swap-specific details The second parameter defines what tokens we're putting into the swap The third parameter defines what tokens we expect to receive from the swap The sequence of these parameters must match the sequence of actions we defined earlier (SWAP_EXACT_IN_SINGLE, SETTLE_ALL, and TAKE_ALL). 3.5: Executing the Swap​ Now we can execute the swap using the Universal Router: bytes[] memory inputs = new bytes[](1);// Combine actions and params into inputsinputs[0] = abi.encode(actions, params);// Execute the swapuint256 deadline = block.timestamp + 20;router.execute(commands, inputs, deadline); This prepares and executes the swap based on our encoded commands, actions, and parameters. Note: Never use block.timestamp or type(uint256).max as the deadline parameter. 3.6: (Optional) Verifying the Swap Output​ After the swap, we need to verify that we received at least the minimum amount of tokens we specified: amountOut = key.currency1.balanceOf(address(this));require(amountOut >= minAmountOut, "Insufficient output amount"); 3.7: Returning the Result​ Finally, we return the amount of tokens we received: return amountOut; This allows the caller of the function to know exactly how many tokens were received in the swap. Here's the complete swap function that combines all the steps we've covered: function swapExactInputSingle( PoolKey calldata key, uint128 amountIn, uint128 minAmountOut) external returns (uint256 amountOut) { // Encode the Universal Router command bytes memory commands = abi.encodePacked(uint8(Commands.V4_SWAP)); bytes[] memory inputs = new bytes[](1); // Encode V4Router actions bytes memory actions = abi.encodePacked( uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL) ); // Prepare parameters for each action bytes[] memory params = new bytes[](3); params[0] = abi.encode( IV4Router.ExactInputSingleParams({ poolKey: key, zeroForOne: true, amountIn: amountIn, amountOutMinimum: minAmountOut, hookData: bytes("") }) ); params[1] = abi.encode(key.currency0, amountIn); params[2] = abi.encode(key.currency1, minAmountOut); // Combine actions and params into inputs inputs[0] = abi.encode(actions, params); // Execute the swap uint256 deadline = block.timestamp + 20; router.execute(commands, inputs, deadline); // Verify and return the output amount amountOut = key.currency1.balanceOf(address(this)); require(amountOut >= minAmountOut, "Insufficient output amount"); return amountOut;}
+</file>
+
+<file path="foundry.lock">
+{
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.11.0",
+      "rev": "8e40513d678f392f398620b3ef2b418648b33e89"
+    }
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.5.0",
+      "rev": "fcbae5394ae8ad52d8e580a3477db99814b9d565"
+    }
+  },
+  "lib/permit2": {
+    "rev": "cc56ad0f3439c502c246fc5cfcc3db92bb8b7219"
+  },
+  "lib/universal-router": {
+    "rev": "41183d6eb154f0ab0e74a0e911a5ef9ea51fc4bd"
+  },
+  "lib/v2-core": {
+    "tag": {
+      "name": "v1.0.1",
+      "rev": "4dd59067c76dea4a0e8e4bfdda41877a6b16dedc"
+    }
+  },
+  "lib/v3-core": {
+    "tag": {
+      "name": "v1.0.0",
+      "rev": "e3589b192d0be27e100cd0daaf6c97204fdb1899"
+    }
+  },
+  "lib/v4-core": {
+    "tag": {
+      "name": "v4.0.0",
+      "rev": "e50237c43811bd9b526eff40f26772152a42daba"
+    }
+  },
+  "lib/v4-periphery": {
+    "rev": "3779387e5d296f39df543d23524b050f89a62917"
+  }
+}
+</file>
+
+<file path="foundry.toml">
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+auto_detect_solc = false
+evm_version = "cancun"
+via_ir = true
+remappings = [
+  "@uniswap/v4-core/=lib/v4-core/",
+  "@uniswap/v4-periphery/=lib/v4-periphery/",
+  "@uniswap/permit2/=lib/permit2/",
+  "@uniswap/universal-router/=lib/universal-router/",
+  "@uniswap/v3-core/=lib/v3-core/",
+  "@uniswap/v2-core/=lib/v2-core/",
+  "@openzeppelin/=lib/openzeppelin-contracts/",
+  "forge-std/=lib/forge-std/src/",
+  "v4-periphery/contracts/=lib/v4-periphery/src/"
+]
+
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
+
+[etherscan]
+mainnet = { key = "${ETHERSCAN_API_KEY}" }
+</file>
+
+</files>
