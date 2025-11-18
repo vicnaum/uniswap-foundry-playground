@@ -81,6 +81,16 @@ library V3PoolTargetLib {
         return _buildResult(snapshot, targetTick, sqrtTarget);
     }
 
+    function targetFromPrice(
+        V3PoolUtils.TokenMetadata memory token0,
+        V3PoolUtils.TokenMetadata memory token1,
+        V3PoolUtils.PoolSnapshot memory snapshot,
+        uint256 priceNum,
+        uint256 priceDen
+    ) internal pure returns (TargetResult memory result) {
+        return _targetFromPrice(token0, token1, snapshot, priceNum, priceDen);
+    }
+
     function logTarget(
         TargetResult memory result,
         V3PoolUtils.TokenMetadata memory token0,

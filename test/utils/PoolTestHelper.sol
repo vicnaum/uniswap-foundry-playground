@@ -125,10 +125,7 @@ abstract contract V4PoolTestHelper is Test {
         delta = liquidityHelper.modifyLiquidity(
             poolKey,
             ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: int256(uint256(liquidity)),
-                salt: salt
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: int256(uint256(liquidity)), salt: salt
             }),
             ""
         );
@@ -142,10 +139,7 @@ abstract contract V4PoolTestHelper is Test {
         delta = liquidityHelper.modifyLiquidity(
             poolKey,
             ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: -int256(uint256(liquidity)),
-                salt: salt
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: -int256(uint256(liquidity)), salt: salt
             }),
             ""
         );
